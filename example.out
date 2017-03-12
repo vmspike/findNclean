@@ -1,0 +1,163 @@
+user@host:~/path/to/findNclean$./findNclean find -c ./findNclean.conf.example 2>&1 | grep -v 'Permission denied'
+2017-03-13T02:04:02 10853 Start action: find
+2017-03-13T02:04:02 10853 Config: ./findNclean.conf.example
+2017-03-13T02:04:02 10853 Debug mode enabled
+2017-03-13T02:04:02 10853 Config rules count: 2
+2017-03-13T02:04:02 10853 Relative paths allowed. Current dir: /home/user/path/to/findNclean
+2017-03-13T02:04:02 10853 Effective config content:
+<Global>
+    DEBUG = true
+    REL_PATH_ALLOW = true
+    APPROVED_SUFFIX = .approved
+</Global>
+<Rule1  find/move old unused *.tmp files in /tmp, /var and current user home dir>
+    result_list = ./ancient-tmp.find-example.csv
+    search_path = /var/
+    search_path = /tmp/
+    search_path = ~/
+    type = f
+    name = .*\.tmp
+    accessed < 2017
+    move_path    = ./
+    move_log     = ./ancient-tmp.move-example.csv
+    move_log_err = ./ancient-tmp.move-example.err.csv
+</Rule1>
+<Rule2  The same as above but for small non-zero logs>
+    result_list = ./ancient-logs.find-example.csv
+    search_path = ~/
+    search_path = /var/
+    search_path = /tmp/
+    type = f
+    name = .*\.log(\.gz)?
+    size >  0
+    size <= 2M
+    accessed < 2017
+    move_path    = ./
+    move_log     = ./ancient-logs.move-example.csv
+    move_log_err = ./ancient-logs.move-example.err.csv
+</Rule2>
+2017-03-13T02:04:02 10853 All non-zero size existing result_list files will be preliminary backuped:
+2017-03-13T02:04:02 10853 The following commands will be evaluated (you can copy-paste them to bash terminal as is):
+  find -P -O3 -- /var/ /tmp/ /home/user/  -regextype posix-extended \(  \! -name \*$'\n'\*   -type f -regex .\*/.\*\\.tmp \! -newerat 2017-01-01T00:00:00  -fprintf ./ancient-tmp.find-example.csv %y\;%s\;%TY-%Tm-%TdT%TH:%TM:%TS\;%AY-%Am-%AdT%AH:%AM:%AS\;%u\;%g\;%p\\n \) , \(  \! -name \*$'\n'\*   -type f -regex .\*/.\*\\.log\(\\.gz\)\? -size +0c \( -size -2097152c -o -size 2097152c \) \! -newerat 2017-01-01T00:00:00  -fprintf ./ancient-logs.find-example.csv %y\;%s\;%TY-%Tm-%TdT%TH:%TM:%TS\;%AY-%Am-%AdT%AH:%AM:%AS\;%u\;%g\;%p\\n \)
+2017-03-13T02:04:02 10853 Wait for all background processes completion...
+2017-03-13T02:04:06 10853 Completed in 4 sec
+2017-03-13T02:04:06 10853 Found items count (filenames with newline was excluded from the search):
+  0 ./ancient-tmp.find-example.csv
+  7 ./ancient-logs.find-example.csv
+  7 total
+2017-03-13T02:04:06 10853 WARNING: Some 'find' commands returned non-zero exit code, results could be incomplete or incorrect!
+2017-03-13T02:04:06 10853 Exit codes list: 1
+2017-03-13T02:04:06 10853 Finished action: find
+
+user@host:~/path/to/findNclean$vim ./ancient-logs.find-example.csv
+
+user@host:~/path/to/findNclean$mv ./ancient-logs.find-example.csv{,.approved}
+user@host:~/path/to/findNclean$mv ./ancient-tmp.find-example.csv{,.approved}
+
+user@host:~/path/to/findNclean$./findNclean mv -c ./findNclean.conf.example
+2017-03-13T02:05:32 11141 Start action: mv
+2017-03-13T02:05:32 11141 Config: ./findNclean.conf.example
+2017-03-13T02:05:32 11141 Debug mode enabled
+2017-03-13T02:05:32 11141 Config rules count: 2
+2017-03-13T02:05:32 11141 Relative paths allowed. Current dir: /home/user/path/to/findNclean
+2017-03-13T02:05:32 11141 Effective config content:
+<Global>
+    DEBUG = true
+    REL_PATH_ALLOW = true
+    APPROVED_SUFFIX = .approved
+</Global>
+<Rule1  find/move old unused *.tmp files in /tmp, /var and current user home dir>
+    result_list = ./ancient-tmp.find-example.csv
+    search_path = /var/
+    search_path = /tmp/
+    search_path = ~/
+    type = f
+    name = .*\.tmp
+    accessed < 2017
+    move_path    = ./
+    move_log     = ./ancient-tmp.move-example.csv
+    move_log_err = ./ancient-tmp.move-example.err.csv
+</Rule1>
+<Rule2  The same as above but for small non-zero logs>
+    result_list = ./ancient-logs.find-example.csv
+    search_path = ~/
+    search_path = /var/
+    search_path = /tmp/
+    type = f
+    name = .*\.log(\.gz)?
+    size >  0
+    size <= 2M
+    accessed < 2017
+    move_path    = ./
+    move_log     = ./ancient-logs.move-example.csv
+    move_log_err = ./ancient-logs.move-example.err.csv
+</Rule2>
+2017-03-13T02:05:32 11141 All non-zero size existing move_log and move_log_err files will be preliminary backuped:
+2017-03-13T02:05:32 11141 Start processing the following move lists in background:
+  0 ./ancient-tmp.find-example.csv.approved
+  2 ./ancient-logs.find-example.csv.approved
+  2 total
+2017-03-13T02:05:32 11141 Wait for all background processes completion...
+mv: cannot move '/var/log/openvpn/00004-test.log' to './00004-test.log': Permission denied
+mv: cannot move '/var/log/openvpn/00009-tmp.log' to './00009-tmp.log': Permission denied
+2017-03-13T02:05:32 11141 Completed in 0 sec
+2017-03-13T02:05:32 11141 Moved items count (successful canceled failed move_log  [move_log_err]):
+  0 0 0 ./ancient-tmp.move-example.csv  ./ancient-tmp.move-example.err.csv
+  0 0 2 ./ancient-logs.move-example.csv  ./ancient-logs.move-example.err.csv
+  0 0 2 total
+2017-03-13T02:05:32 11141 Finished action: mv
+removed '/dev/shm/findNclean.exch26957.tmp'
+removed '/dev/shm/findNclean.exch24396.tmp'
+
+user@host:~/path/to/findNclean$sudo ./findNclean mv -c ./findNclean.conf.example
+2017-03-13T02:06:48 11394 Start action: mv
+2017-03-13T02:06:48 11394 Config: ./findNclean.conf.example
+2017-03-13T02:06:48 11394 Debug mode enabled
+2017-03-13T02:06:48 11394 Config rules count: 2
+2017-03-13T02:06:48 11394 Relative paths allowed. Current dir: /home/user/path/to/findNclean
+2017-03-13T02:06:48 11394 Effective config content:
+<Global>
+    DEBUG = true
+    REL_PATH_ALLOW = true
+    APPROVED_SUFFIX = .approved
+</Global>
+<Rule1  find/move old unused *.tmp files in /tmp, /var and current user home dir>
+    result_list = ./ancient-tmp.find-example.csv
+    search_path = /var/
+    search_path = /tmp/
+    search_path = ~/
+    type = f
+    name = .*\.tmp
+    accessed < 2017
+    move_path    = ./
+    move_log     = ./ancient-tmp.move-example.csv
+    move_log_err = ./ancient-tmp.move-example.err.csv
+</Rule1>
+<Rule2  The same as above but for small non-zero logs>
+    result_list = ./ancient-logs.find-example.csv
+    search_path = ~/
+    search_path = /var/
+    search_path = /tmp/
+    type = f
+    name = .*\.log(\.gz)?
+    size >  0
+    size <= 2M
+    accessed < 2017
+    move_path    = ./
+    move_log     = ./ancient-logs.move-example.csv
+    move_log_err = ./ancient-logs.move-example.err.csv
+</Rule2>
+2017-03-13T02:06:48 11394 All non-zero size existing move_log and move_log_err files will be preliminary backuped:
+2017-03-13T02:06:48 11394 Start processing the following move lists in background:
+  0 ./ancient-tmp.find-example.csv.approved
+  2 ./ancient-logs.find-example.csv.approved
+  2 total
+2017-03-13T02:06:48 11394 Wait for all background processes completion...
+2017-03-13T02:06:48 11394 Completed in 0 sec
+2017-03-13T02:06:48 11394 Moved items count (successful canceled failed move_log  [move_log_err]):
+  0 0 0 ./ancient-tmp.move-example.csv  ./ancient-tmp.move-example.err.csv
+  2 0 0 ./ancient-logs.move-example.csv  ./ancient-logs.move-example.err.csv
+  2 0 0 total
+2017-03-13T02:06:48 11394 Finished action: mv
+removed '/dev/shm/findNclean.exch24681.tmp'
+removed '/dev/shm/findNclean.exch11002.tmp'

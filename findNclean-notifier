@@ -1,0 +1,3 @@
+#!/bin/bash
+# This is just a stub, change it as you need.
+echo "findNclean-notifier: $1, $2" >&2

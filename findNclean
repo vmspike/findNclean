@@ -1,0 +1,1726 @@
+#!/bin/bash
+
+read -r -d '' DESCRIPTION <<'EOF'
+    findNclean created to automate filesystem cleaning and/or file searching.
+
+    You can use it as 'find' superstructure to run/schedule multiple heavy
+    and optimized commands at the same time with logging of all found files.
+
+    You can set find and/or move options in specific config and then run single
+    simple command or create multiple cron jobs for all configurations you need.
+    Find action heavily rely on 'find', so it's fast enough.
+    Bash builtins extensively used, so dependencies list is short enough.
+    It designed to support ancient environments (like CentOS 5.5) but to use
+    features of modern envs (like Ubuntu 16.04) if possible.
+
+    For more info just run it without arguments.
+    For even more info see the code ;)!
+EOF
+
+
+### Possible improvements
+# - Support MOVE_STRUCTURE=tree
+# - Action 'automove'
+# - See inline TODO comments
+# - Calculate execution time correctly (independently of host datetime)
+# - Log size for folders (currently size logged for files only)
+# - User/group name regex (transform to several users on the system with OR because find does not support regex for user/group names)
+# - Full support for files with a name containing a newline (for mv action and find calculations, now only 'find' logging supported)
+# - Globbing support for search_path (currently only explicitly specified path allowed)
+# - Implement timezone support for ancient env (e.g. workaround for touch - use find TZ variable?)
+# - Test on various platforms and environments (currently only tested on CentOS 5.5 and Ubuntu 16.04 LTS)
+### END Possible improvements
+
+FINDNCLEAN_VERSION=0.2.2
+
+### Adjustments for different environments
+printf -v BV '%d%03d%03d' "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" "${BASH_VERSINFO[2]}"  # Bash version in numbers like 4003046, where 4 is major version, 003 is minor, 046 is subminor.
+((BV < 3002025)) && echo "WARNING: bash version ${BASH_VERSION} is too old (below 3.2.25)! This app was not tested with too ancient versions!" >&2
+
+# printf -v FV '%d%03d%03d' $(find --version | grep -m1 -o -E '[0-9]+\.[0-9]+\.[0-9]+' | tr . ' ')  # Find version similar way
+read -ra tmp < <(exec -c find --version)  # Read first line
+for i in "${tmp[@]}"; do
+    if [[ "${i}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        IFS='.' read -ra tmp <<<"${i}"
+        printf -v FV '%d%03d%03d' "${tmp[0]}" "${tmp[1]}" "${tmp[2]%%[^0-9]*}"
+        break
+    fi
+done
+[[ -z "${FV}" ]] && FV=4000000  # Default to version 4.0.0
+((FV < 4002027)) && echo "WARNING: find version is too old (below 4.2.27)! This app was not tested with too ancient versions!" >&2
+### END Adjustments for different environments
+
+
+### Configurable default variables (most of them can be overrided on config level in <Global> section)
+# CONFIG=/usr/local/etc/findNclean/findNclean.conf  # Default config
+CONFIG=./findNclean.conf  # Default config
+
+LC_ALL=C  # Force C locale to unify all outputs
+
+REL_PATH_ALLOW=0  # If relative paths allowed in config
+
+IGNORE_FILES_WITH_NEWLINES=1  # If 1 (true) filenames with newline will not be found in all cases
+
+if ((FV >= 4007000)); then  # TODO: find initial version with -Olevel support
+    FIND_OPTS='-P -O3'  # 'find' command line options
+else  # Ancient find has no -Olevel option
+    FIND_OPTS='-P'  # 'find' command line options.
+fi
+
+FIND_EXPR_GLOBAL=''  # Global 'find' expressions common for all rules. Will be right after search paths.
+FIND_EXPR_POSITIONAL='-regextype posix-extended'  # Positional 'find' expressions common for all rules. Will be right after global.
+FIND_EXPR_TESTS_SHARED=''  # Test 'find' expressions common for all rules. Will be right after positional.
+
+RULES_JOIN_ALLOW=1  # Allow optimize performance by join Rules with identical search_paths collection
+
+S=';'  # CSV separator for output files
+
+DEBUG=0  # Debug provide more verbose output
+
+## Path for small temporary files
+if [[ -w /dev/shm ]]; then  # Shared memory on modern hosts
+    TMPDIR=/dev/shm
+elif [[ -w /run/shm ]]; then  # Shared memory on ancient hosts
+    TMPDIR=/run/shm
+else  # Default temporary directory
+    TMPDIR=/tmp
+fi
+
+# APPROVED_PREFIX=''  # DEV
+# APPROVED_SUFFIX='.approved'
+APPROVED_SUFFIX=''
+
+DEFAULT_MOVE_ATTEMPTS=1
+DEFAULT_MOVE_ATTEMPTS_INTERVAL=30
+
+NOTIFICATION_SCRIPT=''  # Path to notification script
+
+## What to to if destination file exists
+## Affect only action 'move', files like move_log_err, move_log, result_list will be backuped in all cases.
+MOVE_MODE_IF_DEST_EXISTS=r  # Could be: backup|b, overwrite|o, rename|r
+
+## Destination dir structure, could be flat or tree (f or t).
+## If file /path/to/file.ext moved to /z/dest/, file will be moved to:
+##   flat - /z/dest/file.ext
+##   tree - /z/dest/path/to/file.ext
+MOVE_STRUCTURE=f
+### END Configurable default variables
+
+
+### Constants (do not change if not sure!)
+readonly ACTION=$1
+
+## Space-separated list of required apps which must be on the system
+DEPENDENCIES='find wc mv'
+((BV <= 4002000)) && DEPENDENCIES+=' date'
+((FV <  4003005)) && DEPENDENCIES+=' touch'
+# DEPENDENCIES+=' getent'
+readonly DEPENDENCIES
+
+# Must be ISO-8601 compatible!
+# Will be used for logging as datefmt for printf OR date (depends on log() implementation). printf doesn't support nanoseconds!
+# Also used for file modify/access times logging
+readonly TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S'
+# readonly TIMESTAMP_FORMAT='%Y-%m-%dT%H:%M:%S.%N%z'  # DEV
+
+# readonly TIME_BIT='0.000000001 sec'  # Nanosecond
+# readonly TIME_BIT='sec'  # One second
+
+## Date and time, with optional fractional seconds, time zone.
+## Note: find doesn't support leap second.
+## Examples:
+##   2008-08-30T01:45:36
+##   2008-08-30T01:45:36.123Z
+##   2008-08-30T01:45:36.123456789+0700
+##   2008-08-30T01:45:59-05:27
+## TODO: improve RE_ISO_8601 to add rare cases (like 30 Feb)
+# readonly RE_ISO_8601='^[0-9]{4}-(1[0-2]|0[1-9])-(3[01]|0[1-9]|[12][0-9])T(2[0-3]|[01][0-9]):([0-5][0-9]):([0-5][0-9])(\.[0-9]+)?(Z|[+-](2[0-3]|[01][0-9]):?[0-5][0-9])?$'
+# timezones support removed to support 'touch -d' (required for ancient environment)
+readonly RE_ISO_8601='^[0-9]{4}-(1[0-2]|0[1-9])-(3[01]|0[1-9]|[12][0-9])T(2[0-3]|[01][0-9]):([0-5][0-9]):([0-5][0-9])(\.[0-9]+)?$'
+
+readonly RE_NAME_REGEX='^([a-z_][-a-z0-9_]{0,30})|([0-9]{0,10})$'  # Linux user or group name (numeric U32 ID allowed)
+
+readonly RE_CONF_SKIP='^[[:blank:]]*(#.*)?$'  # Regex for the lines which should be skipped in config
+
+readonly RE_CONF_GLOBALS_START='^<Global>[[:blank:]]*$'
+readonly RE_CONF_GLOBALS_END='^</Global>[[:blank:]]*$'
+
+readonly RE_CONF_RULE_START='^<Rule[0-9]*([[:blank:]]+.*)?>[[:blank:]]*$'
+readonly RE_CONF_RULE_END='^</Rule[0-9]*>[[:blank:]]*$'
+# readonly RE_CONF_RULE_START='^<Rule>[[:blank:]]*$'
+# readonly RE_CONF_RULE_END='^</Rule>[[:blank:]]*$'
+
+readonly EOL=$'\n'  # Newline
+
+## Variables substitution enabled here
+read -r -d '' USAGE <<EOF
+Usage:
+    findNclean [ACTION] [OPTIONS]
+
+ACTION
+    [usage|help]
+        Print this help.
+        If '-c' option specified show help for config usage instead.
+
+    tricks
+        Print useful tricks.
+
+    version
+        Show findNclean version.
+
+    [find|search]
+        Find files, directories, or symlinks on filesystem according to
+        configuration rules.
+
+    [approve|confirm]
+        Not implemented.
+        You have to manually overview and approve list of files by appending
+        corresponding APPROVED_SUFFIX to the result_list value. By default
+        APPROVED_SUFFIX is none, so all result_list will be treated as
+        approved.
+
+    [move|mv]
+        Move files or directories listed on specified files.
+
+    automove
+        Not implemented.
+        Automatically move found files or directories without creation
+        intermediate filelists.
+
+OPTIONS
+    -c CONFIG
+        Specify config to use instead of default ${CONFIG}.
+        If used with 'help' action show config usage instead of this help.
+
+    [-d|-v]
+        Debug mode. Verbose output.
+        Also can be specified in config Global options.
+
+DESCRIPTION
+    ${DESCRIPTION}
+EOF
+
+read -r -d '' CONFIG_USAGE <<'EOF'
+Config usage:
+
+    Config have to contain one or more rules. In simple case rule starts with
+    the tag '<Rule>' and end with '</Rule>'. Optionally you can enumerate
+    and/or comment Rule inside, e.g. use '<Rule1  1st rule>...</Rule1>'.
+    See RE_CONF_RULE_* regex constants for more info.
+
+    Number of the rule is positional number starts with 1.
+    For each rule separate result file(s) will be created.
+
+    Options shared for all Rules can be specified inside global section
+    between tags '<Global>' and '</Global>'. See config example with
+    explanations below.
+
+    Leading spaces and tabs are ignored. Comments starts with '#'. Inline
+    comments does NOT supported. Option name and value have to be separated by
+    operator surrounded by any number of spaces or tabs. Option value starts
+    at first non-blank symbol after operator and ends at the end of line.
+    Value and operator can NOT be empty, only some defaults can be, so if you
+    need default empty value just comment this option. True/False values can
+    be set in either ways: 1, y, yes, true OR 0, n, no, false.
+
+    All of 'find' action options for specific rule will be joined using AND,
+    so found item will match all of them. Exception is some options that can
+    be specified multiple times like 'perm', they will be grouped using OR
+    before join with other options.
+
+
+    The Rule can contain the following options and operators (for default
+    values if any see config example below):
+    result_list =
+        Mandatory for 'find' and 'move' actions. Filename to write results of
+        find. Recommended extension is '.csv'. Value read as is, the same way
+        as for search_path. Base directory must exist on the system and be
+        writable for current user. For 'move' action it also define source
+        files with list to move but with APPROVED_SUFFIX appended. By default
+        APPROVED_SUFFIX is none. Only one option per rule allowed.
+        Output file format (it's single line):
+            [1]filetype_letter;[2]size_in_bytes;[3]modification_iso8601_time;
+              [4]access_iso8601_time;[5]username;[6]groupname;
+              [7-]path_to_file
+        So the result line can be like this (it's single line):
+            f;3710;2016-11-19T17:31:23.2176460070;
+              2016-11-19T17:31:27.8257603100;
+              root;root;/etc/somedir/filename with semicolon;.csv
+
+        If filename with newline found (see IGNORE_FILES_WITH_NEWLINES) it
+        will be writed as is, so log line will be splitted.
+
+    Action 'find' specific options:
+    search_path =
+        Mandatory for 'find' action. Explicit path where items will be
+        searched. Value read as is - no quoting, no globbing, no escape
+        characters, no regex. You can specify it multiple times to set
+        several paths. Must start with '/', or if relative paths allowed can
+        start with any character but './' will be prepended if it does not
+        start with './', '../', or '~/'. '~/' will expand to current user
+        home directory.
+        Directory must exist on filesystem.
+
+    type =
+        Allowed values are f, d, l for file, directory, symlink. Natural
+        representations also supported: file, dir, directory, link, symlink.
+        Can be specified not more than one time.
+
+    name =
+        Regex for matching file/dir/link name only, not full path bacause '.*/'
+        will be automatically prepended. By default posix-extended regex are
+        used, but it can be overrided in FIND_EXPR_POSITIONAL.
+        Can be specified not more than one time.
+
+    size {=|<|>|<=|>=|!=}
+        Size of file in bytes (directories recursive size does not supported).
+        Multipliers allowed: c=1 b=512 w=2 k=1024 M=1048576 G=1073741824 It's
+        correspond to 'find' size multipliers but will be converted to bytes
+        'c' instead of passing as is, to avoid 'find' a bit weird behavior
+        (see 'man find' for '-size').
+        Can be specified several times.
+
+    accessed {>|<}
+    modified {>|<}
+    changed {>|<}
+    born {>|<}
+        Last access/modification/change/birth time.
+        Must be specified in ISO-8601 format, optionally in shortened form.
+        Timezones does not supported because of compartibility with ancient
+        environments.
+        Can be specified several times.
+
+        Some valid examples:
+            2014        # will be complemented to 2014-01-01T00:00:00
+            2015-03     # will be complemented to 2015-03-01T00:00:00
+            2016-08-29  # will be complemented to 2016-08-29T00:00:00
+            2008-08-30T01:45:36
+            2008-08-30T01:45:36.123
+            2008-08-30T01:45:36.123456789
+            2008-08-30T01:45
+
+        In comparison with modification time change time also changed if meta
+        data changed, e.g. permissions.
+        Be carefull with birth time ('born' option), it can be not supported
+        by find version, filesystem, or OS. If so 'find' processes for the
+        Rules with this option will fail. E.g. it cannot be used on even
+        modern Linux kernels in most cases because of 'find' and 'stat'
+        limitations:
+            http://lists.gnu.org/archive/html/bug-findutils/2011-11/msg00015.html
+        Filesystem items can has this time set but 'find/stat' cannot read it.
+        You can check it via:
+            find ./somefile -newerBt 1970-01-01
+            stat ./somefile
+            debugfs -R "stat <$(stat -c %i ./somefile)>" /dev/DRIVEX
+
+    amin {>|=|<}
+    cmin {>|=|<}
+    mmin {>|=|<}
+        File was last accessed/changed/modified N minutes ago:
+        > N for greater than N
+        < N for less than N
+        = N for exactly N
+        For more info see corresponding 'find' options.
+        Can be specified several times.
+
+    user =
+    group =
+        Owner or group. Numeric UID allowed. No regex, just real name.
+        Can be specified not more than one time.
+
+    nouser =
+    nogroup =
+        No user/group corresponds to file's numeric user/group ID.
+        Value can be only true: 1, y, yes, true
+        Can be specified not more than one time.
+
+    perm =
+        Permissions 'find' option.
+        Can be specified several times. If so all 'perm' options will be
+        joined using OR.
+
+
+    Action 'move' specific options:
+    move_path =
+        Mandatory for 'move' action. Set path to move files. Value parsed the
+        same way as for search_path. Can be specified several times. If so
+        next path will be used only if all move_attempts to previous move_path
+        was exceeded.
+
+    move_attempts =
+        Number of move attempts before use next move_path or fail to move
+        specific item.
+        Can be specified not more than one time.
+
+    move_attempts_interval =
+        Interval in seconds to wait before next move attempt.
+        Can be specified not more than one time.
+
+    move_log =
+        Mandatory for 'move' action. Like for result_list but for 'move'
+        action logging.
+        Can be specified not more than one time.
+
+        Output file format can be like this:
+            2017-01-25T03:29:25 '../mo.csv' -> './moved 62/mo.csv'
+            2017-01-25T03:29:26 '../mo2.csv' -> './moved 62/mo2.csv' (backup:
+                './moved 62/mo2.csv.~1~')
+        If moved filename has single quote it will be replaced by '\'' (single
+        quote, backslash, two single quotes), it's default 'mv -v' behavior.
+
+    move_log_err =
+        Like move_log but for move errors only. If not specified all errors
+        goes to move_log. Can be specified not more than one time.
+
+    move_compress =
+        Not implemented.
+        Enable gzip compression for moved items and set compression level.
+        Can be specified not more than one time.
+
+
+findNclean config example:
+# Options shared for all Rules
+<Global>
+    # Path to notification script. Should be closer to the top of options.
+    # Will be called on non-zero exit code, move failure or other actions.
+    # If unset no messages will be send and warning will will be shown at
+    # the end of Global's parsing.
+    # (default is none)
+    # NOTIFICATION_SCRIPT = ./findNclean-notifier
+
+    # Notification addresses. Should be closer to the top of options.
+    # Space splitted list will be passed to NOTIFICATION_SCRIPT as 2nd
+    # argument.
+    # (default is none)
+    # NOTIFY = mailto:rulezz@example.com
+    # NOTIFY = jabber:ihateemail@example.net
+
+    # If relative paths allowed in config. If true relative paths will be
+    # logged, but you can use relative paths in any place.
+    # (default: false)
+    # REL_PATH_ALLOW = true
+
+    # If true filenames with newline will not be found in all cases,
+    # othervise if matched file found it will be logged as is and then
+    # 'move' action will fail on it.
+    # (default: true)
+    # IGNORE_FILES_WITH_NEWLINES = false
+
+    # CSV separator for output files
+    # (default: ;)
+    # S = ;
+
+    # Verbose output (the same as -d or -v option)
+    # (default: false)
+    # DEBUG = true
+
+    # Path for small temporary files
+    # (default: /dev/shm or /run/shm or /tmp)
+    # TMPDIR = ./temp
+
+    # Allow optimize find performance by join Rules with identical
+    # search_paths collection.
+    # If true and representations of identical search_paths are different
+    # (e.g. /var/ and /etc/../var, or binded dirs) first available
+    # search_paths set will be used as main and so logged.
+    # (default: true)
+    # RULES_JOIN_ALLOW = false
+
+    # String appended to result_list filenames to get filename which is
+    # approved to move.
+    # It's usefull if you want to separate not approved files.
+    # Approval can be done by appending this suffix to filename.
+    # (default is none)
+    # APPROVED_SUFFIX = .approved
+
+    # Default move_attempts value for all Rules where it's unspecified
+    # (default: 1)
+    # DEFAULT_MOVE_ATTEMPTS = 1
+
+    # Default move_attempts_interval value for all Rules where it's
+    # unspecified
+    # (default: 30)
+    # DEFAULT_MOVE_ATTEMPTS_INTERVAL = 10
+
+    # Specify how to act if destination file exists.
+    # Affect only action 'move', files like move_log_err, move_log,
+    # result_list will be backuped in all cases.
+    # Options are:
+    #   rename - rename moving file by adding '.TIMESTAMP~' or if file with
+    #     new name also exists '.TIMESTAMP-N~', where TIMESTAMP format is
+    #     %Y%m%d%H%M%S,
+    #     N is some unique number.
+    #   backup - verbosely backup existing destination file(s) via
+    #     'mv --backup=t', so extensions of existing files will be '.~1~',
+    #     '.~2~' etc., and move log line will have note in the end like
+    #     " (backup: './moved 62/mo2.csv.~1~')".
+    #   overwrite - silently overwrite existing destination file.
+    # Short notations also allowed: r, b, o.
+    # (default: r)
+    # MOVE_MODE_IF_DEST_EXISTS = backup
+
+    # NOT IMPLEMENTED: tree
+    # Destination dir structure. Could be 'flat' or 'tree'.
+    # If file /path/to/file.ext moved to /z/dest/, file.ext will be moved to:
+    #   flat - /z/dest/file.ext
+    #   tree - /z/dest/path/to/file.ext, so it preserve directories structure.
+    # Short notations also allowed: f, t.
+    # (default: flat)
+    # MOVE_STRUCTURE=tree
+
+
+    ## Use FIND_* options with cauton, make sure it's supported by platform!
+    # 'find' command line options
+    # (default: -P -O3 [if supported])
+    # FIND_OPTS = -L
+
+    # Global 'find' expressions common for all rules. Will be right after
+    # search paths.
+    # (default is none)
+    # FIND_EXPR_GLOBAL = -depth
+
+    # Positional 'find' expressions common for all rules. Will be right after
+    # global.
+    # (default: -regextype posix-extended)
+    # FIND_EXPR_POSITIONAL = -regextype posix-extended
+</Global>
+
+# Minimal Rule that just find/move all items inside /tmp directory
+<Rule>
+    result_list = /var/log/findNclean/find/All items inside tmp directory.csv
+    search_path = /tmp
+    move_path = /z/tmp
+    move_log = /var/log/findNclean/move/All items inside tmp directory.csv
+</Rule>
+
+# Complex rule
+<Rule>
+    result_list = /var/log/findNclean/find/logs1.csv
+
+    ## find only options
+    search_path = /var/log/
+    search_path = /tmp/
+    search_path = /mnt/drv9/
+    type = f
+    name = .*\.log
+    size >= 1M
+    size <  1G
+    # user = root
+    group = www-data
+    nouser = true
+    # nogroup = true
+    perm = 660
+    perm = -u+rwx,g+r
+    perm = /002
+    # born < 2014
+    modified > 2016-12
+    modified < 2017
+    accessed > 2016-12-31T23:59:59.999999999
+    changed  > 2017-02-01T00:00:00
+    # atime > 120
+    # mtime = 240
+    # ctime < 34
+
+    ## move only options
+    move_path = /z/logs/
+    move_path = /x/logs/
+    move_attempts = 2
+    move_attempts_interval = 10
+    move_log     = /var/log/findNclean/move/logs1.csv
+    move_log_err = /var/log/findNclean/move/logs1.err.csv
+    # move_compress = 9 not supported yet
+</Rule>
+
+# BAd $tYle but va1ID rulE
+  <Rule>
+  search_path =    /!Other/path/to be escaped
+search_path = /all/paths/should/exists/
+      # search_path = ./rel/path/if/allowed
+    search_path = /home/user/valid/if/exists
+    # search_path = /*globbing?-not/supported/yet
+    ## Yep, it's also valid filename, but no-escapes interpreted.
+    result_list = /var/log/findNclean/$(echo 'Oops, exploit!')[:blank:]\r\n\t.csv
+    type = dir
+    # result_list = ./-list2.csv
+    # result_list =    ./leading spaces truncated here.csv
+    # name =  (posix|extended|regex)?.*\.txt$
+    size   =   0
+    modified > 2015-12-01T00:00:01
+    modified < 2017-03-01T00:00:00.9876
+    user = 0
+    group = 1000
+    accessed > 2016-03-01T00:00:00.64
+</Rule>
+EOF
+
+read -r -d '' TRICKS <<'EOF'
+Deploy:
+    No need to deploy, but if you want to use it system wide, the following
+    actions can be useful:
+    - Put the script to /usr/local/bin/ or create symlink
+        ln -s /path/to/findNclean /usr/local/bin/
+    - Make it executable
+        chmod +x /usr/local/bin/findNclean
+    - Put default config to /usr/local/etc/findNclean/findNclean.conf
+    - Create symlink to default config
+        ln -s /usr/local/{etc/findNclean,bin}/findNclean.conf
+    - Create directory for results
+        mkdir -p /var/log/findNclean/
+
+See result_list in human readable format sorted by size (if no filenames with
+newline logged):
+    sort -t\; -rk2 /path/to/result_list.csv | column -s\; -t | less -S
+EOF
+### END Constants
+
+
+### Initial values of variables (doesn't need to init empty or zero vars)
+RULES_COUNT=0  # Count of rules found in config
+RESULT_LISTS=()  # Array with escaped result_list filenames
+SRC_LISTS=()  # The same elements as in RESULT_LISTS but each with trailing APPROVED_SUFFIX
+Commands=()  # Array with 'find' commands for each rule (or joined 'find' commands)
+TMP_FILES=()  # Temporary escaped filenames created during script execution
+CONFIG_CONTENT=''  # Text config content without comments and empty lines
+
+## MOVE_PATH${N} variable is array of move_paths of Rule[N-1]
+## Indirect expansion will be used for them
+# MOVE_PATH=()  # Commented
+
+## Nth element correspond to [N-1]th Rule for these variables
+MOVE_LOG=()
+MOVE_LOG_ERR=()
+MOVE_ATTEMPTS=()
+MOVE_ATTEMPTS_INTERVAL=()
+MOVE_COMPRESS=()
+NOTIFY=()
+MOVE_OK_COUNT=()
+MOVE_CANCEL_COUNT=()
+MOVE_FAIL_COUNT=()
+
+### END Initial values of variables
+
+
+### Functions
+quit() {
+    [[ -n $2 ]] && echo "$2" >&2
+    # for f in "${TMP_FILES[@]}"; do rm -${v}f -- "$f"; done &>/dev/null
+    [[ -n "${TMP_FILES[*]}" ]] && eval rm -${v}f -- "${TMP_FILES[@]}" >&2  # Eval because filenames are escaped
+    (($1 > 0 && $1 < 255)) && notify "exit code is $1.${EOL}Message: $2"
+    exit "$1"
+}
+
+if ((BV > 4002000)); then  # Modern bash versions
+log() {
+    ## Fast (builtin) but sec is min sample for most implementations
+    printf "%(${TIMESTAMP_FORMAT})T %5d %s\n" '-1' $$ "$*"  # %b convert escapes, %s print as is
+}
+
+##
+# Set global TIMESTAMP variable with current time format $1
+# Globals:
+#   $2 or TIMESTAMP
+# Args:
+#   timestamp format
+#   variable name to set
+##
+set_timestamp() {
+    # local FORMAT VARNAME
+    # if [[ -z $2 ]]; then FORMAT='%Y%m%d%H%M%S'; else FORMAT=$2; fi
+    # if [[ -z $1 ]]; then VARNAME='TIMESTAMP'; else VARNAME=$1; fi
+    # printf -v "${VARNAME}" "%(${FORMAT})T" '-1'
+    printf -v "$1" "%($2)T" '-1'  # Quick: no checks
+}
+else  # Legacy bash versions
+log() {
+    ## Slow (subshell, date) but support nanoseconds
+    echo "$(exec -c date +"${TIMESTAMP_FORMAT}") $$ $*"
+}
+
+set_timestamp() {
+    # local FORMAT VARNAME
+    # if [[ -z $2 ]]; then FORMAT='%Y%m%d%H%M%S'; else FORMAT=$2; fi
+    # if [[ -z $1 ]]; then VARNAME='TIMESTAMP'; else VARNAME=$1; fi
+    # printf -v "${VARNAME}" '%s' "$(exec -c date +"${FORMAT}")"
+    # # TIMESTAMP="$(exec -c date +"${FORMAT}")"
+    printf -v "$1" '%s' "$(exec -c date +"$2")"  # Quick: no checks
+}
+fi
+
+# log_err() {
+#     log "$@" >&2
+# }
+
+notify() {
+    ## Launch notification script in background
+    if [[ -x "${NOTIFICATION_SCRIPT}" && -n "${NOTIFY[*]}" ]]; then
+        eval "'${NOTIFICATION_SCRIPT}' 'findNclean pid $$: $1' '${NOTIFY[*]}'" &
+    else
+        # TODO: try to notify if NOTIFY is not empty
+        :
+    fi
+}
+
+##
+# Sorts positional arguments using iterative quicksort
+# Globals:
+#   QSORTED
+# Returns:
+#   QSORTED (array)
+# Note:
+#   Iterative (for small number of elements ~<10)
+##
+# qsort() {
+#     (($#==0)) && return 0
+#     local stack beg end i pivot smaller larger
+#     stack=( 0 $(($#-1)) )
+#     QSORTED=("$@")
+#     while ((${#stack[@]})); do
+#         beg=${stack[0]}
+#         end=${stack[1]}
+#         stack=("${stack[@]:2}")
+#         smaller=()
+#         larger=()
+#         pivot=${QSORTED[beg]}
+#         for ((i=beg+1; i<=end; ++i)); do
+#             if [[ "${QSORTED[i]}" < "${pivot}" ]]; then
+#                 smaller+=("${QSORTED[i]}")
+#             else
+#                 larger+=("${QSORTED[i]}")
+#             fi
+#         done
+#         QSORTED=("${QSORTED[@]:0:beg}" "${smaller[@]}" "$pivot" "${larger[@]}" "${QSORTED[@]:end+1}")
+#         if ((${#smaller[@]}>=2)); then stack+=("$beg" "$((beg+${#smaller[@]}-1))"); fi
+#         if ((${#larger[@]}>=2)); then stack+=("$((end-${#larger[@]}+1))" "$end"); fi
+#     done
+# }
+
+##
+# Wrap filenames to single quotes like 'mv -v' do for filenames output.
+# Globals and Args:
+#   $1
+#   $2
+##
+single_quote_wrap() {
+    local content
+    eval "content=\$$1"
+    if [[ -n $2 ]]; then # Put result in this variable
+        printf -v "$2" '%s' "'${content//\'/\'\\\'\'}'"
+    else  # Wrap the same variable
+        printf -v "$1" '%s' "'${content//\'/\'\\\'\'}'"
+    fi
+}
+
+##
+# Convert positional variables to array
+# Need to convert space separated escaped paths to unescaped array:
+#   eval "vars2array ${var}"
+# Globals:
+#   VARS2ARRAY
+##
+vars2array() {
+    local var
+    VARS2ARRAY=()
+    for var in "$@"; do
+        VARS2ARRAY+=("${var}")
+    done
+}
+
+##
+# Complete global verifications and variable setting
+# Must be called only one time after config Globals parsing or if Globals is absent in config
+##
+complete_globals() {
+    if ((IGNORE_FILES_WITH_NEWLINES)); then
+        FIND_EXPR_TESTS_SHARED+=" \! -name \*$'\n'\* "
+    fi
+    if ! [[ -w "${TMPDIR}" ]]; then
+        quit 1 "ERROR: Temporary directory is not writeable: ${TMPDIR}"
+    fi
+    printf -v FIND_PRINTF_FORMAT '%q' "%y${S}%s${S}${TIMESTAMP_FORMAT//%/%T}${S}${TIMESTAMP_FORMAT//%/%A}${S}%u${S}%g${S}%p\n"
+
+
+    readonly FIND_PRINTF_FORMAT
+    readonly REL_PATH_ALLOW
+    readonly IGNORE_FILES_WITH_NEWLINES
+    readonly FIND_OPTS
+    readonly FIND_EXPR_GLOBAL
+    readonly FIND_EXPR_POSITIONAL
+    readonly FIND_EXPR_TESTS_SHARED
+    readonly RULES_JOIN_ALLOW
+    readonly S
+    readonly TMPDIR
+    # readonly APPROVED_PREFIX
+    readonly APPROVED_SUFFIX
+    readonly DEBUG
+    if ((DEBUG)); then
+        readonly v=v
+    else
+        readonly v=''
+    fi
+}
+
+##
+# Run all commands in args in parallel with corresponding logging
+# Globals:
+#   PARALLEL_RUN_EXIT_CODES - array with exit codes
+#   PARALLEL_RUN_EXCHANGE_TMPFILE
+# Args:
+#   commands to run as a positional args
+##
+parallel_run() {
+    local ts TS i j pids tmp EXCHANGE_TMPFILE
+    set_timestamp ts '%s'
+    pids=()
+    PARALLEL_RUN_EXIT_CODES=()
+    PARALLEL_RUN_EXCHANGE_TMPFILE=()
+    j=0
+    for i in "$@"; do
+        ## This variable will be used by subprocess to store results
+        EXCHANGE_TMPFILE="${TMPDIR}/findNclean.exch${RANDOM}.tmp"  # Not escaped
+        eval "${i}" &
+        pids+=("$!")
+        # EXCHANGE_TMPFILE="${TMPDIR}/findNclean.exch$!.tmp"  # Not escaped. Subprocess have to setup variable with their own pid: EXCHANGE_TMPFILE="${TMPDIR}/findNclean.exch$$.tmp"
+
+        printf -v tmp '%q' "${EXCHANGE_TMPFILE}"  # Escaped
+        PARALLEL_RUN_EXCHANGE_TMPFILE[$((j++))]=${tmp}
+    done
+    log 'Wait for all background processes completion...'
+    for i in "${pids[@]}"; do
+        wait "${i}"
+        PARALLEL_RUN_EXIT_CODES+=("$?")
+    done
+    set_timestamp TS '%s'
+    log "Completed in $((TS-ts)) sec"
+}
+
+##
+# Parse 'line' variable and set arg_* variables accordingly
+# Globals:
+#   arg_name
+#   arg_op
+#   arg_val
+##
+parse_config_line_option() {
+    ## Leading spaces and tabls already removed
+    # line=${line#${line%%[^[:blank:]]*}}  # Remove leading spaces and tabs
+
+    arg_name=${line%%[[:blank:]]*}  # Remove all after space including itself
+    arg_op=${line##${arg_name}}  # Remove all below "${arg_name}" including itself
+    arg_op=${arg_op#${arg_op%%[^[:blank:]]*}}  # Remove leading spaces
+    arg_op=${arg_op%%[[:blank:]]*}  # Remove all after space or tab including itself
+    arg_val=${line#${arg_name}[[:blank:]]*${arg_op}}  # Remove all below "${arg_op} " including itself
+
+    ## Trim leading space-like characters in arg_val
+    arg_val=${arg_val#${arg_val%%[^[:blank:]]*}}  # Remove leading spaces and tabs
+    # echo "DEV:${arg_name}:${arg_op}:${arg_val}"  # DEV
+
+    [[ "${arg_op}" =~ ^(=|<|>|<=|>=|!=)$ ]] || quit 1 "Config ERROR on line ${line_number}: Invalid operator: ${arg_op}"
+    [[ -z ${arg_val} ]] && quit 1 "Config ERROR on line ${line_number}: Empty value for option '${arg_name}'"
+}
+
+##
+# Parse config file and modify vars accordingly.
+# For 'find' action create find array with find commands to execute.
+# Globals:
+#   REL_PATH_ALLOW
+#   IGNORE_FILES_WITH_NEWLINES
+#   FIND_OPTS
+#   FIND_EXPR_GLOBAL
+#   FIND_EXPR_POSITIONAL
+#   FIND_EXPR_TESTS_SHARED
+#   FIND_PRINTF_FORMAT
+#   S
+#   DEBUG
+#   TMPDIR
+#   APPROVED_PREFIX
+#   APPROVED_SUFFIX
+#   RESULT_LISTS
+#   SRC_LISTS
+#   RULES_COUNT
+#   TMP_FILES
+#   Commands
+#   CONFIG_CONTENT
+#   MOVE_PATH${N}  # Bunch of variables
+#   MOVE_LOG
+#   MOVE_LOG_ERR
+#   MOVE_ATTEMPTS
+#   MOVE_ATTEMPTS_INTERVAL
+#   MOVE_COMPRESS
+#   NOTIFY
+##
+parse_config() {
+    local rule_num rule_unclosed line_number type_val move_path
+    local FIND_PATHS FIND_EXPR_TESTS FIND_EXPR_ACTIONS
+    local arg_name arg_op arg_val arg line multiplier X o f i j k tmp tmp2 N
+    local Commands_paths Commands_tests_actions Commands_groups Commands_tmp grp cmd grps VARS2ARRAY
+    ## local *_count specified later
+    Commands_paths=()
+    Commands_tests_actions=()
+    Commands_groups=()
+    Commands_tmp=()
+    line_number=0
+    rule_num=0  # 1-based positional number of the rule
+    rule_unclosed=0  # 0:false
+    globals_started=0  # 0:false
+    globals_ended=0  # 0:false
+    while IFS= read -r line || [[ -n ${line} ]]; do
+        ((++line_number))
+
+        ## Ignore comments or blank lines
+        [[ "${line}" =~ ${RE_CONF_SKIP} ]] && continue
+
+        CONFIG_CONTENT+="${EOL}${line}"
+
+        line=${line#${line%%[^[:blank:]]*}}  # Remove leading spaces and tabs
+
+        ## Start of the Global section
+        if [[ "${line}" =~ ${RE_CONF_GLOBALS_START} ]] && ((!globals_started)); then
+            globals_started=1  # 1:true
+        ## End of the Global section
+        elif [[ "${line}" =~ ${RE_CONF_GLOBALS_END} ]] && ((!globals_ended)); then
+            globals_ended=1  # 1:true
+        ## Global opts
+        elif [[ "${globals_started}" = 1 ]] && ((!globals_ended)); then
+            parse_config_line_option
+
+            [[ "${arg_op}" != '=' ]] && quit 1 "Config ERROR on line ${line_number}: Invalid operator for option '${arg_name}': ${arg_op}"
+
+            if [[  "${arg_name}" = REL_PATH_ALLOW
+                || "${arg_name}" = IGNORE_FILES_WITH_NEWLINES
+                || "${arg_name}" = DEBUG
+                || "${arg_name}" = RULES_JOIN_ALLOW
+               ]]; then
+                case "${arg_val}" in
+                    0|n|no|false) eval "${arg_name}=0" ;;
+                    1|y|yes|true) eval "${arg_name}=1" ;;
+                    *) quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                esac
+            elif [[ "${arg_name}" = FIND_OPTS ]]; then
+                if ((FV >= 4007000)); then
+                    tmp='^-(P|L|H|O[0-3])$'
+                else
+                    tmp='^-(P|L|H)$'
+                fi
+                for o in ${arg_val}; do
+                    [[ "${o}" =~ ${tmp} ]] || quit 1 "Config ERROR on line ${line_number}: Invalid entry in value for option '${arg_name}': ${o}"
+                done
+                FIND_OPTS=${arg_val}
+            elif [[ "${arg_name}" = FIND_EXPR_GLOBAL ]]; then
+                FIND_EXPR_GLOBAL=''
+                for o in ${arg_val}; do  # Do not escape spaces
+                    printf -v tmp '%q' "${o}"
+                    FIND_EXPR_GLOBAL+=" ${tmp}"
+                done
+            elif [[ "${arg_name}" = FIND_EXPR_POSITIONAL ]]; then
+                FIND_EXPR_POSITIONAL=''
+                for o in ${arg_val}; do  # Do not escape spaces
+                    printf -v tmp '%q' "${o}"
+                    FIND_EXPR_POSITIONAL+=" ${tmp}"
+                done
+            elif [[ "${arg_name}" = TMPDIR ]]; then
+                TMPDIR=${arg_val}
+            # elif [[ "${arg_name}" = APPROVED_PREFIX ]]; then
+            #     printf -v APPROVED_PREFIX '%q' "${arg_val}"
+            elif [[ "${arg_name}" = APPROVED_SUFFIX ]]; then
+                printf -v APPROVED_SUFFIX '%q' "${arg_val}"
+            elif [[ "${arg_name}" = DEFAULT_MOVE_ATTEMPTS ]]; then
+                [[ "${arg_val}" =~ ^[1-9][0-9]*$ ]] || quit 1 "Config ERROR on line ${line_number}: Value is not a number greater than zero: ${arg_val}"
+                DEFAULT_MOVE_ATTEMPTS=${arg_val}
+            elif [[ "${arg_name}" = DEFAULT_MOVE_ATTEMPTS_INTERVAL ]]; then
+                [[ "${arg_val}" =~ ^[0-9]+$ ]] || quit 1 "Config ERROR on line ${line_number}: Value is not a number: ${arg_val}"
+                DEFAULT_MOVE_ATTEMPTS_INTERVAL=${arg_val}
+            elif [[ "${arg_name}" = S ]]; then
+                S=${arg_val}
+                ((${#S} = 1)) || quit 1 "Config ERROR on line ${line_number}: Invalid length for csv separator '${arg_name}': ${#S}"
+            elif [[ "${arg_name}" = NOTIFICATION_SCRIPT ]]; then
+                [[ -x "${arg_val}" ]] || log "Config WARNING on line ${line_number}: NOTIFICATION_SCRIPT doesn't exist or not executable: ${arg_val}"
+                # printf -v NOTIFICATION_SCRIPT '%q' "${arg_val}"
+                NOTIFICATION_SCRIPT=${arg_val}
+            elif [[ "${arg_name}" = NOTIFY ]]; then
+                printf -v tmp '%q' "${arg_val}"
+                NOTIFY+=("${tmp}")
+            elif [[ "${arg_name}" = MOVE_MODE_IF_DEST_EXISTS ]]; then
+                case "${arg_val}" in
+                    backup|b|overwrite|o|rename|r) ;;
+                    *) quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                esac
+                MOVE_MODE_IF_DEST_EXISTS=${arg_val}
+            elif [[ "${arg_name}" = MOVE_STRUCTURE ]]; then
+                case "${arg_val}" in
+                    flat|f|tree|t) ;;
+                    *) quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                esac
+                MOVE_STRUCTURE=${arg_val}
+            else
+                quit 1 "Config ERROR on line ${line_number}: Unrecognized global option: '${arg_name}'"
+            fi
+        ## Start of the Rule
+        elif [[ "${line}" =~ ${RE_CONF_RULE_START} ]]; then
+            ((rule_unclosed)) && quit 1 "Config ERROR on line ${line_number}: Rule started before previous rule closed"
+            if ((!rule_num)); then  # rule_num == 0
+                globals_started=1  # 1:true
+                globals_ended=1  # 1:true
+                complete_globals
+            fi
+            ((++rule_num))
+            # Reset some variables
+            for tmp in result_list move_log move_log_err move_compress move_attempts move_attempts_interval type name size perm nouser nogroup amin mmin cmin; do
+                local ${tmp}_count
+                eval "${tmp}_count=0"
+            done
+            rule_unclosed=1  # 1:true
+            PERM=''
+            FIND_PATHS=()
+            FIND_EXPR_TESTS=''
+            FIND_EXPR_ACTIONS=''
+        ## End of the Rule
+        elif [[ "${line}" =~ ${RE_CONF_RULE_END} ]]; then
+            ((rule_unclosed)) || quit 1 "Config ERROR on line ${line_number}: Rule has no open tag"
+
+            if [[ -n "${PERM}" ]]; then  # Add 'perm' options
+                ((perm_count)) && PERM=" \(${PERM} \)"  # Add parentheses to avoid issues
+                FIND_EXPR_TESTS+=${PERM}
+            fi
+
+            [[ -z "${FIND_EXPR_TESTS}${FIND_EXPR_ACTIONS}" ]] && quit 1 "Config ERROR on line ${line_number}: Empty Rule"
+
+            rule_unclosed=0  # 0:false
+            RULES_COUNT=${rule_num}
+
+            ((result_list_count)) || quit 1 "Config ERROR on line ${line_number}: 'result_list' option is mandatory"
+
+            case "${ACTION}" in
+                find|search)
+                    [[ -z ${FIND_PATHS[*]} ]] && quit 1 "Config ERROR on line ${line_number}: 'search_path' option is mandatory for action ${ACTION}"
+                    [[ "${type_val}" != f ]] && ((size_count)) && quit 1 "Config ERROR on line ${line_number}: 'size' option supported only for type 'f'"
+
+                    ## Variables for Commands entry is (must be) already escaped (except some spaces)!
+                    Commands+=("find ${FIND_OPTS} -- ${FIND_PATHS[*]} ${FIND_EXPR_GLOBAL} ${FIND_EXPR_POSITIONAL} ${FIND_EXPR_TESTS_SHARED} ${FIND_EXPR_TESTS} ${FIND_EXPR_ACTIONS}")
+                    if ((RULES_JOIN_ALLOW)); then
+                        ## Arrays for check if several 'find' commands join possible (if several rules has the same FIND_PATHS)
+                        # qsort "${FIND_PATHS[@]}"  # Set QSORTED array
+                        # Commands_paths+=("${QSORTED[*]}")
+                        Commands_paths+=("${FIND_PATHS[*]}")
+                        Commands_tests_actions+=("${FIND_EXPR_TESTS_SHARED} ${FIND_EXPR_TESTS} ${FIND_EXPR_ACTIONS}")
+                    fi
+                    ;;
+                move|mv)
+                    N=$((rule_num-1))
+                    move_path="MOVE_PATH${N}[0]"
+                    [[ -z ${!move_path} ]] && quit 1 "Config ERROR on line ${line_number}: 'move_path' option is mandatory for action ${ACTION}"
+                    [[ -z ${MOVE_LOG[${N}]} ]] && quit 1 "Config ERROR on line ${line_number}: 'move_log' option is mandatory for action ${ACTION}"
+                    [[ -z ${MOVE_LOG_ERR[${N}]} ]] && MOVE_LOG_ERR[${N}]=${MOVE_LOG[${N}]}
+                    [[ -z ${MOVE_ATTEMPTS[${N}]} ]] && MOVE_ATTEMPTS[${N}]=${DEFAULT_MOVE_ATTEMPTS}
+                    [[ -z ${MOVE_ATTEMPTS_INTERVAL[${N}]} ]] && MOVE_ATTEMPTS_INTERVAL[${N}]=${DEFAULT_MOVE_ATTEMPTS_INTERVAL}
+                    ;;
+            esac
+        ## Rule opts
+        else
+            [[ "${line: : 1}" = '<' && "${line: -1}" = '>' ]] && quit 1 "Config ERROR on line ${line_number}: Invalid tag: ${line}"
+            ((rule_unclosed)) || quit 1 "Config ERROR on line ${line_number}: Config option specified outside of Rule"
+
+            ## Parse options for current rule
+            parse_config_line_option
+
+            ### Use 'if' instead of 'case' for compatibility with older bash versions
+            ## arg_op checks
+            if [[  "${arg_name}" = 'search_path'
+                || "${arg_name}" = 'type'
+                || "${arg_name}" = 'name'
+                || "${arg_name}" = 'result_list'
+                || "${arg_name}" = 'user'
+                || "${arg_name}" = 'group'
+                || "${arg_name}" = 'perm'
+                || "${arg_name}" = 'nouser'
+                || "${arg_name}" = 'nogroup'
+                || "${arg_name}" = 'move_path'
+                || "${arg_name}" = 'move_log'
+                || "${arg_name}" = 'move_log_err'
+                || "${arg_name}" = 'move_attempts'
+                || "${arg_name}" = 'move_attempts_interval'
+                # || "${arg_name}" = 'move_compress'
+                # || "${arg_name}" = 'notify'
+               ]]; then
+                [[ "${arg_op}" = '=' ]] || quit 1 "Config ERROR on line ${line_number}: Invalid operator for option '${arg_name}': ${arg_op}"
+            fi
+            if [[ "${arg_name}" = 'size' ]]; then
+                [[ "${arg_op}" =~ ^(=|<|>|<=|>=|!=)$ ]] || quit 1 "Config ERROR on line ${line_number}: Invalid operator for option '${arg_name}': ${arg_op}"
+            fi
+            if [[ "${arg_name}" = 'modified'
+                || "${arg_name}" = 'accessed'
+                || "${arg_name}" = 'changed'
+                || "${arg_name}" = 'born'
+               ]]; then
+                # Doesn't support = <= >= != because find exact timestamps are tricky and buggy
+                [[ "${arg_op}" =~ ^(<|>)$ ]] || quit 1 "Config ERROR on line ${line_number}: Invalid operator for option '${arg_name}': ${arg_op}"
+            fi
+            if [[  "${arg_name}" = 'mmin'
+                || "${arg_name}" = 'amin'
+                || "${arg_name}" = 'cmin'
+               ]]; then
+                [[ "${arg_op}" =~ ^(<|=|>)$ ]] || quit 1 "Config ERROR on line ${line_number}: Invalid operator for option '${arg_name}': ${arg_op}"
+            fi
+
+            ## Path options checks
+            if [[  "${arg_name}" = 'search_path'
+                || "${arg_name}" = 'result_list'
+                || "${arg_name}" = 'move_path'
+                || "${arg_name}" = 'move_log'
+                || "${arg_name}" = 'move_log_err'
+               ]]; then
+                if [[ "${arg_val: : 1}" != '/' ]]; then
+                    if ! ((REL_PATH_ALLOW)); then  # Absolute path only
+                        quit 1 "Config ERROR on line ${line_number}: Value restricted to be full path for option '${arg_name}'"
+                    else  # Relative path allowed
+                        if   ((${#arg_val} >= 3)) && [[ "${arg_val::3}" = '../' ]] \
+                          || ((${#arg_val} >= 2)) && [[ "${arg_val::2}" = './'  ]]; then
+                            :
+                        # else  # Not ./ or ../
+                        #     # quit 1 "Config ERROR on line ${line_number}: Relative path must have leading ./ or ../"
+                        elif [[ "${arg_val}" = '.' || "${arg_val}" = '..' ]]; then
+                            arg_val+='/'  # Append /
+                        elif ((${#arg_val} >= 2)) && [[ "${arg_val::2}" = '~/' ]]; then
+                            arg_val="${HOME}/${arg_val:2}"  # Manual tilde expansion
+                        else
+                            arg_val="./${arg_val}"  # Prepend ./ to avoid issues
+                        fi
+                    fi
+                fi
+            fi
+
+            ## Number checks
+            if [[  "${arg_name}" = 'move_attempts'
+                || "${arg_name}" = 'move_attempts_interval'
+                || "${arg_name}" = 'mmin'
+                || "${arg_name}" = 'amin'
+                || "${arg_name}" = 'cmin'
+                # || "${arg_name}" = 'move_compress'
+               ]]; then
+               [[ "${arg_val}" =~ ^[0-9]+$ ]] || quit 1 "Config ERROR on line ${line_number}: Value is not a number: ${arg_val}"
+            fi
+
+            ## Log/results checks
+            if [[  "${arg_name}" = 'result_list'
+                || "${arg_name}" = 'move_log'
+                || "${arg_name}" = 'move_log_err'
+               ]]; then
+                [[ "${arg_val: -1}" = '/' || -d "${arg_val}" ]] && quit 1 "Config ERROR on line ${line_number}: Filename expected, got directory: ${arg_val}"
+                [[ -d "${arg_val%/*}/" ]] || quit 1 "Config ERROR on line ${line_number}: No such directory: ${arg_val%/*}/"
+                if ! [[ -w "${arg_val%/*}/" ]]; then
+                    if [[ "${ACTION}" =~ ^(move|mv)$ && "${arg_name}" = 'result_list' ]]; then
+                        :
+                    else
+                        quit 1 "Config ERROR on line ${line_number}: Directory is not writable: ${arg_val%/*}/"
+                    fi
+                fi
+            fi
+
+            ## Check for multiple options (only single option or no option allowed)
+            if [[ "${arg_name}" = 'result_list'
+               || "${arg_name}" = 'type'
+               || "${arg_name}" = 'name'
+               || "${arg_name}" = 'move_log'
+               || "${arg_name}" = 'move_log_err'
+               || "${arg_name}" = 'move_attempts'
+               || "${arg_name}" = 'move_attempts_interval'
+               # || "${arg_name}" = 'move_compress'
+               || "${arg_name}" = 'nouser'
+               || "${arg_name}" = 'nogroup'
+               ]]; then
+                if eval "((++${arg_name}_count > 1))"; then
+                    msg="Config ERROR on line ${line_number}: Multiple '${arg_name}' options"
+                    case "${arg_name}" in
+                        type) msg+='. Keep only one or remove all of them to match any type.' ;;
+                        name) msg+='. Use single regex to match all files you want to find.' ;;
+                        nouser|nogroup) msg+='. Allowed values are only: 1 y yes true' ;;
+                    esac
+                    quit 1 "${msg}"
+                fi
+            fi
+
+            ## TODO: Check for uniqueness of all result_list, approved result_list, [move_log AND move_log_err] depends on ACTION. Done only for result_list's
+
+            if [[ "${arg_name}" = 'result_list' ]]; then
+                tmp2=${arg_val}  # Not escaped
+                printf -v arg_val '%q' "${arg_val}"  # Escape filename
+                FIND_EXPR_ACTIONS+=" -fprintf ${arg_val} ${FIND_PRINTF_FORMAT}"
+
+                ## All result_list filenames must be unique
+                i=1
+                for f in "${RESULT_LISTS[@]}"; do
+                    eval "tmp=${f}"  # Unescape
+                    if [[ "${tmp}" -ef "${tmp2}" ]]; then
+                        eval "arg_val=${arg_val}"  # Unescape arg_val
+                        quit 1 "Config ERROR on line ${line_number}: The Rule ${i} already specified the same result_list file as the Rule ${rule_num}: ${arg_val}"
+                    fi
+                    ((++i))
+                done
+                RESULT_LISTS+=("${arg_val}")  # Already escaped filename
+                case "${ACTION}" in
+                    move|mv|automove)
+                        SRC_LISTS+=("${arg_val}${APPROVED_SUFFIX}")
+                        eval "tmp=${arg_val}${APPROVED_SUFFIX}"
+                        if ! [[ -r "${tmp}" ]]; then
+                            quit 1 "Config ERROR on line ${line_number}: Effective source file is not readable: ${tmp}"
+                        fi
+                        ;;
+                esac
+            elif [[ "${arg_name}" = 'search_path' ]]; then
+                [[ -d "${arg_val}" || -f "${arg_val}" ]] || quit 1 "Config ERROR on line ${line_number}: No such file or directory: ${arg_val}"
+                printf -v tmp '%q' "${arg_val}"
+                FIND_PATHS+=("${tmp}")
+            elif [[ "${arg_name}" = 'type' ]]; then
+                # Convert some human readable types to 'find' accepted
+                case "${arg_val}" in
+                    file)          arg_val=f ;;
+                    dir|directory) arg_val=d ;;
+                    link|symlink)  arg_val=l ;;
+                esac
+                [[ "${arg_val}" =~ ^[dfl]$ ]] || quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                FIND_EXPR_TESTS+=" -type ${arg_val}"
+                type_val=${arg_val}
+            elif [[ "${arg_name}" = 'name' ]]; then
+                [[ "${arg_val}" =~ ^[[:space:]] ]] && log_err "Config WARNING on line ${line_number}: Leading space-like character detected in value of option '${arg_name}'. Make sure it's what you need."
+                ## Leading .*/ required for match name only, otherwise find use full path match
+                printf -v arg_val '%q' ".*/${arg_val}"  # Escape regex
+                FIND_EXPR_TESTS+=" -regex ${arg_val}"
+            elif [[ "${arg_name}" = 'size' ]]; then
+                ((++size_count))
+                if [[ "${arg_val}" =~ ^[0-9]+$ ]]; then
+                    ## 'c' means bytes, without suffix defaults to for 512-byte blocks
+                    arg_val+='c'
+                elif [[ "${arg_val}" =~ ^[0-9]+[bwkMG]$ ]]; then
+                    ## Convert to 'c' because of weird find behavior (see 'man find' for '-size')
+                    case "${arg_val: -1}" in
+                        b) multiplier=512 ;;
+                        w) multiplier=2 ;;
+                        k) multiplier=1024 ;;
+                        M) multiplier=1048576 ;;
+                        G) multiplier=1073741824 ;;
+                    esac
+                    # ((arg_val=multiplier*${arg_val: : -1}))
+                    ((arg_val=multiplier*${arg_val: : ${#arg_val}-1}))  # For older bash versions compatibility
+                    arg_val+='c'
+                else
+                    quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                fi
+                case "${arg_op}" in
+                     '=') FIND_EXPR_TESTS+=" -size ${arg_val}" ;;
+                     '<') FIND_EXPR_TESTS+=" -size -${arg_val}" ;;
+                     '>') FIND_EXPR_TESTS+=" -size +${arg_val}" ;;
+                    '<=') FIND_EXPR_TESTS+=" \( -size -${arg_val} -o -size ${arg_val} \)" ;;
+                    '>=') FIND_EXPR_TESTS+=" \( -size +${arg_val} -o -size ${arg_val} \)" ;;
+                    '!=') FIND_EXPR_TESTS+=" \( -size -${arg_val} -o -size +${arg_val} \)" ;;
+                esac
+            elif [[ "${arg_name}" = 'accessed'
+                 || "${arg_name}" = 'modified'
+                 || "${arg_name}" = 'changed'
+                 || "${arg_name}" = 'born'
+                 ]]; then
+
+                if [[ "${arg_val}" =~ ${RE_ISO_8601} ]]; then
+                    :  # All fine, do nothing
+                ## Try to complete time if possible
+                elif [[ "${arg_val}" =~ ^[0-9]+-[0-9]+-[0-9]+$ ]]; then  # Year-Month-Day
+                    arg_val+='T00:00:00'
+                elif [[ "${arg_val}" =~ ^[0-9]+-[0-9]+$ ]]; then  # Year-Month
+                    arg_val+='-01T00:00:00'
+                elif [[ "${arg_val}" =~ ^[0-9]+$ ]]; then  # Year
+                    arg_val+='-01-01T00:00:00'
+                ## Failed to complete
+                else
+                    quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                fi
+                printf -v arg_val '%q' "${arg_val}"
+                if ((FV >= 4003005)); then  # support -newerXY
+                    case "${arg_name}" in
+                        accessed) opt=newerat ;;
+                        modified) opt=newermt ;;
+                        changed) opt=newerct ;;
+                        born) opt=newerBt
+                            ## Check if find/stat can use birth time
+                            # tmp=$(exec -c stat -c '%W' /)
+                            # if [[ $? -ne 0 || "${tmp}" = '0' || "${tmp}" = 'W' ]]; then
+                            #     quit 1 "Config ERROR on line ${line_number}: OS or filesystem does not support birth time"
+                            # fi
+                            ;;
+                    esac
+                    arg=${arg_val}
+                else  # not support, have to create temporary mark file
+                    case "${arg_name}" in
+                        accessed) opt=anewer ;;
+                        modified) opt=newer ;;
+                        changed) opt=cnewer ;;
+                        born) quit 1 "Config ERROR on line ${line_number}: This version of find does not support birth time" ;;
+                    esac
+                    printf -v arg '%q' "${TMPDIR}/findNclean.${arg_val}.tmp"
+                    touch -m "${arg}" -d "${arg_val}"
+
+                    ## Add file to TMP_FILES if it's not there yet
+                    tmp=1  # 1:true
+                    for f in "${TMP_FILES[@]}"; do
+                        if [[ "${f}" = "${arg}" ]]; then
+                            tmp=0  # Already exist
+                            break
+                        fi
+                    done
+                    ((tmp)) && TMP_FILES+=("${arg}")  # Add if not exist yet
+                fi
+                ## Universal case
+                case "${arg_op}" in
+                     '<') FIND_EXPR_TESTS+=" \! -${opt} ${arg}" ;;
+                     '>') FIND_EXPR_TESTS+=" -${opt} ${arg}" ;;
+                esac
+            elif [[ "${arg_name}" = 'user'
+                 || "${arg_name}" = 'group'
+                 ]]; then
+                [[ "${arg_val}" =~ ${RE_NAME_REGEX} ]] || quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+
+                # if [[ "${arg_name}" = 'user' ]]; then
+                #     [[ "${arg_val}" =~ ^[0-9]+$ ]] || getent passwd "${arg_val}" &>/dev/null || quit 1 "Config ERROR on line ${line_number}: No such user: ${arg_val}"
+                # else  # group
+                #     [[ "${arg_val}" =~ ^[0-9]+$ ]] || getent group "${arg_val}" &>/dev/null || quit 1 "Config ERROR on line ${line_number}: No such group: ${arg_val}"
+                # fi
+                case "${arg_name}" in
+                     user) tmp2=passwd ;;
+                    group) tmp2=group  ;;
+                esac
+                if ! [[ "${arg_val}" =~ ^[0-9]+$ ]]; then
+                    while read -r tmp || [[ -n ${tmp} ]]; do
+                        [[ ${tmp%%:*} = "${arg_val}" ]] && break
+                    done </etc/${tmp2} \
+                    || quit 1 "Config ERROR on line ${line_number}: No such ${arg_name}: ${arg_val}"
+                fi
+
+                printf -v arg_val '%q' "${arg_val}"
+                FIND_EXPR_TESTS+=" -${arg_name} ${arg_val}"
+            elif [[ "${arg_name}" = 'nouser'
+                 || "${arg_name}" = 'nogroup'
+                 ]]; then
+                case "${arg_val}" in
+                    # 0|n|no|false) ;;  # Not allowed
+                    1|y|yes|true)
+                        FIND_EXPR_TESTS+=" -${arg_name}"
+                        ;;
+                    *) quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
+                esac
+            elif [[ "${arg_name}" = 'mmin'
+                 || "${arg_name}" = 'cmin'
+                 || "${arg_name}" = 'amin'
+                 ]]; then
+                case "${arg_op}" in
+                    '<') arg_val="-${arg_val}" ;;
+                    '>') arg_val="+${arg_val}" ;;
+                    # '=') ;;
+                esac
+                FIND_EXPR_TESTS+=" -${arg_name} ${arg_val}"
+            elif [[ "${arg_name}" = 'perm' ]]; then
+                ((++perm_count))
+                [[ "${arg_val}" =~ ^[0-9/ugoa-][0-9ugoa+=,rwxXst-]*$ ]] || quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"  # Basic partial validation
+                printf -v arg_val '%q' "${arg_val}"
+                ((perm_count > 1)) && PERM+=' -o'
+                PERM+=" -${arg_name} ${arg_val}"
+            elif [[ "${arg_name}" = 'move_path' ]]; then
+                case "${ACTION}" in
+                    move|mv|automove)
+                        [[ -d "${arg_val}" ]] || quit 1 "Config ERROR on line ${line_number}: No such directory: ${arg_val}"
+                        [[ -w "${arg_val}" ]] || quit 1 "Config ERROR on line ${line_number}: Directory is not writeable: ${arg_val}"
+                        ;;
+                esac
+                [[ "${arg_val: ${#arg_val}-1}" = '/' ]] && arg_val=${arg_val%/}  # Remove trailing slash if any
+                N=$((rule_num-1))
+                move_path="MOVE_PATH${N}"
+                if [[ -z ${!move_path} ]]; then  # First 'move_path' for this Rule
+                    printf -v ${move_path} '%q' "${arg_val}"
+                else  # Already contain path(s)
+                    printf -v tmp '%q' "${arg_val}"
+                    eval "${move_path}+=(\"${tmp}\")"
+                fi
+            # elif [[ "${arg_name}" = 'notify' ]]; then
+            #     N=$((rule_num-1))
+            #     if [[ -z ${NOTIFY[${N}]} ]]; then  # First 'notify' for this Rule
+            #         printf -v tmp '%q' "${arg_val}"
+            #         NOTIFY[${N}]=${tmp}
+            #     else  # Already contain value(s)
+            #         printf -v tmp '%q' "${arg_val}"
+            #         NOTIFY[${N}]+=" ${tmp}"
+            #     fi
+            elif [[ "${arg_name}" = 'move_log' ]]; then
+                printf -v tmp '%q' "${arg_val}"
+                MOVE_LOG[$((rule_num-1))]=${tmp}
+            elif [[ "${arg_name}" = 'move_log_err' ]]; then
+                printf -v tmp '%q' "${arg_val}"
+                MOVE_LOG_ERR[$((rule_num-1))]=${tmp}
+            elif [[ "${arg_name}" = 'move_attempts' ]]; then
+                printf -v tmp '%q' "${arg_val}"
+                MOVE_ATTEMPTS[$((rule_num-1))]=${tmp}
+            elif [[ "${arg_name}" = 'move_attempts_interval' ]]; then
+                printf -v tmp '%q' "${arg_val}"
+                MOVE_ATTEMPTS_INTERVAL[$((rule_num-1))]=${tmp}
+            # elif [[ "${arg_name}" = 'move_compress' ]]; then
+            #     ((arg_val>=1 && arg_val<=9)) || quit 1 "Config ERROR on line ${line_number}: Invalid gzip compression level: ${arg_val}"
+            #     MOVE_COMPRESS[$((rule_num-1))]=${arg_val}
+            else
+                quit 1 "Config ERROR on line ${line_number}: Unrecognized option: ${arg_name}"
+            fi
+        fi
+    done <"${CONFIG}"
+    ((rule_unclosed)) && quit 1 "Config ERROR on line ${line_number}: Last Rule has no close tag"
+    ((RULES_COUNT)) || quit 1 'Config ERROR: No Rules found'
+
+    ## Try to join several 'find' commands if some rules has the same FIND_PATHS
+    if ((RULES_JOIN_ALLOW)); then
+        # echo; set -x  # DEV
+        for ((i=0; i<${#Commands_paths[@]}; ++i)); do  # Iterate over all indexes
+            for o in ${Commands_groups[*]}; do  # Check if the index was already grouped
+                ((i == o)) && continue 2
+            done
+            grp=${i}  # Initial index for indexes group
+            eval "vars2array ${Commands_paths[${i}]}"
+            X=("${VARS2ARRAY[@]}")
+            for ((j=i+1; j<${#Commands_paths[@]}; ++j)); do  # Iterate over residual indexes
+                tmp=("${X[@]}")  # Yep, it's important to reinit tmp in j loop because of unset below!
+                eval "vars2array ${Commands_paths[${j}]}"
+                tmp2=("${VARS2ARRAY[@]}")
+                if ((${#tmp[@]} == ${#tmp2[@]})); then  # It's a chance that it could be equal
+                    while ((${#tmp[@]})); do
+                        for ((k=0; k<${#tmp[@]}; ++k)); do
+                            for ((o=0; o<${#tmp2[@]}; ++o)); do
+                                if [[ "${tmp[${k}]}" -ef "${tmp2[${o}]}" ]]; then
+                                    unset tmp[${k}] tmp2[${o}]  # Remove this elements from arrays
+                                    tmp=("${tmp[@]}")  # Remove unset items
+                                    tmp2=("${tmp2[@]}")  # Remove unset items
+                                    continue 3
+                                fi
+                            done
+                        done
+                        continue 2
+                    done
+                    grp+=" ${j}"
+                fi
+            done
+            Commands_groups+=("${grp}")
+        done
+
+        for grps in "${Commands_groups[@]}"; do
+            if [[ "${grps%% *}" != "${grps}" ]]; then  # Group of Rules
+                cmd="find ${FIND_OPTS} -- ${Commands_paths[${grps%% *}]} ${FIND_EXPR_GLOBAL} ${FIND_EXPR_POSITIONAL} "
+                for j in ${grps}; do
+                    cmd+="\( ${Commands_tests_actions[${j}]} \) , "
+                done; cmd=${cmd::${#cmd}-3}
+                Commands_tmp+=("${cmd}")
+            else  # Single Rule
+                Commands_tmp+=("${Commands[${grps}]}")
+            fi
+        done
+        Commands=("${Commands_tmp[@]}")  # Replace independent commands to joined
+    fi
+    # set +x; echo; tmp="The following commands will be evaluated (you can copy-paste them to bash terminal as is):"; for i in "${Commands[@]}"; do tmp+="${EOL}  ${i}"; done; log "${tmp}"; exit 111 # DEV
+}  # parse_config
+
+##
+# Process move action for specific Rule number
+# Globals:
+#   MOVE_OK_COUNT
+#   MOVE_CANCEL_COUNT
+#   MOVE_FAIL_COUNT
+# Arguments:
+#   Rule 0-based number
+##
+rule_move() {
+    local N tmp line SRC_FILE dest dest_q attempt differs move_path move_log move_log_err
+    local t sz mt at u g name name_q name_sq dest_name  # Current parameters
+    local T SZ MT AT U G  # Parameters specified in SRC_FILE
+
+    # local EXCHANGE_TMPFILE
+    # EXCHANGE_TMPFILE="${TMPDIR}/findNclean.exch$$.tmp"  # Not escaped
+
+    ## Unescape paths
+    eval "move_log=${MOVE_LOG[${N}]}"
+    eval "move_log_err=${MOVE_LOG_ERR[${N}]}"
+
+    if ((BV > 4002000)); then
+        log_move() {
+            printf "%(${TIMESTAMP_FORMAT})T %s\n" '-1' "$*" >>"${move_log}"
+        }
+        log_move_err() {
+            printf "%(${TIMESTAMP_FORMAT})T %s\n" '-1' "$*" >>"${move_log_err}"
+        }
+    else
+        log_move() {
+            echo "$(date +"${TIMESTAMP_FORMAT}") $*" >>"${move_log}"
+        }
+        log_move_err() {
+            echo "$(date +"${TIMESTAMP_FORMAT}") $*" >>"${move_log_err}"
+        }
+    fi
+
+    N=$1
+    move_path="MOVE_PATH${N}[@]"
+    eval "SRC_FILE=${SRC_LISTS[${N}]}"  # Already checked for existence/readability. eval need to unescape variables
+
+    MOVE_OK_COUNT[${N}]=0
+    MOVE_CANCEL_COUNT[${N}]=0
+    MOVE_FAIL_COUNT[${N}]=0
+
+    while IFS=${S} read -r t sz mt at u g name || [[ -n ${t} ]]; do  # Read lines from SRC_FILE
+        single_quote_wrap name name_sq
+
+        ## Check if the file has the same parameters
+        if ! [[ -a "${name}" ]]; then
+            log_move_err "${name_sq} move canceled: No such file or directory"
+            ((++MOVE_CANCEL_COUNT[N]))
+            continue
+        fi
+
+        printf -v name_q '%q' "${name}"
+        LINE_REAL=$(eval "exec -c find ${name_q} -maxdepth 0 -printf ${FIND_PRINTF_FORMAT}" 2>/dev/null)  # Also will contain error message if any
+        if (($?)); then  # 'find' error
+            # log_move_err "${name_sq} move canceled: source file find error: ${LINE_REAL#find: \'*\': }"
+            log_move_err "${name_sq} move canceled: source file find error"
+            ((++MOVE_CANCEL_COUNT[N]))
+        elif [[ "${t}${S}${sz}${S}${mt}${S}${at}${S}${u}${S}${g}${S}${name}" = "${LINE_REAL}" ]]; then  # Match
+            ## Create dir for MOVE_STRUCTURE=tree
+            # case "${MOVE_STRUCTURE}" in
+            #     tree|t)
+            #         tmp=${name%/*}  # Base directory only
+            #         if [[ "${tmp::2}" = '..' ]]; then
+            #         fi
+            #         mkdir -p "${dest}/${tmp}"
+            # esac
+
+            ## Try to move
+            for dest_q in "${!move_path}"; do
+                eval "dest=${dest_q}"  # Unquoted dest without trailing slash
+                for ((attempt=1; attempt<=${MOVE_ATTEMPTS[${N}]}; ++attempt)); do
+                    # if [[ -z "${MOVE_COMPRESS[${N}]}" ]]; then  # No compression
+                    case "${MOVE_MODE_IF_DEST_EXISTS}" in
+                        rename|r)
+                            if [[ -e "${dest}/${name##*/}" ]]; then
+                                set_timestamp TIMESTAMP '%Y%m%d%H%M%S'
+                                dest_name="${dest}/${name##*/}.${TIMESTAMP}~"
+                                tmp=0
+                                while [[ -e "${dest_name}" ]]; do
+                                    dest_name="${dest}/${name##*/}.${TIMESTAMP}-$((++tmp))~"
+                                done
+                                tmp=$(exec -c mv --backup=t -vT -- "${name}" "${dest_name}")
+                                mv_exit_code=$?
+                            else
+                                tmp=$(exec -c mv --backup=t -vt "${dest}" -- "${name}")
+                                mv_exit_code=$?
+                            fi
+                            ;;
+                        backup|b)
+                            tmp=$(exec -c mv --backup=t -vt "${dest}" -- "${name}")
+                            mv_exit_code=$?
+                            ;;
+                        overwrite|o)
+                            tmp=$(exec -c mv --backup=off -vft "${dest}" -- "${name}")
+                            mv_exit_code=$?
+                            ;;
+                    esac
+                    # else  # Compress
+                    #     tmp=$(exec -c gzip -c -${MOVE_COMPRESS[${N}]} -- "${name}" >"${dest}/${name}")
+                    # fi
+                    # mv_exit_code=$?
+                    if ((!mv_exit_code)); then
+                        log_move "${tmp}"
+                        ((++MOVE_OK_COUNT[N]))
+                        break 2
+                    else
+                        if ((DEBUG)); then
+                            tmp=${dest}
+                            single_quote_wrap tmp
+                            log_move_err "${name_sq} attempt ${attempt}/${MOVE_ATTEMPTS[${N}]} failed to move to ${tmp}"
+                        fi
+                        ((attempt != ${MOVE_ATTEMPTS[${N}]})) && sleep "${MOVE_ATTEMPTS_INTERVAL[${N}]}"  ## Sleep if it's not last attempt
+                    fi
+                done
+            done
+            if ((mv_exit_code)); then
+                log_move_err "${name_sq} move failed: all attempts failed"
+                ((++MOVE_FAIL_COUNT[N]))
+                notify "${name_sq} move failed: all attempts failed"
+            fi
+        else  # Differs
+            differs=''
+            IFS=${S} read -r T SZ MT AT U G tmp <<<"${LINE_REAL}"
+            [[ "${t}"  = "${T}"  ]] || differs+=' type'
+            [[ "${sz}" = "${SZ}" ]] || differs+=' size'
+            [[ "${mt}" = "${MT}" ]] || differs+=' mtime'
+            [[ "${at}" = "${AT}" ]] || differs+=' atime'
+            [[ "${u}"  = "${U}"  ]] || differs+=' user'
+            [[ "${g}"  = "${G}"  ]] || differs+=' group'
+            log_move_err "${name_sq} move canceled: parameters differs:${differs}"
+            ((++MOVE_CANCEL_COUNT[N]))
+        fi
+    done <"${SRC_FILE}"
+
+    ## Write *_COUNT[N] values to temporary file if it's subprocess,
+    ## because we can't push variables to parent shell.
+    if [[ ${BASH_SUBSHELL} -gt 0 && -n "${EXCHANGE_TMPFILE}" ]]; then
+        echo "${MOVE_OK_COUNT[${N}]}:${MOVE_CANCEL_COUNT[${N}]}:${MOVE_FAIL_COUNT[${N}]}" >"${EXCHANGE_TMPFILE}"
+    fi
+}  # rule_move
+### END Functions
+
+
+### Verify environment
+for util in ${DEPENDENCIES}; do
+    hash "${util}" &>/dev/null || quit 1 "ERROR: '${util}' not found on this system"
+done; unset util
+### END Verify environment
+
+
+### Parse options
+[[ "${ACTION}" = 'help' || "${ACTION}" = 'usage' ]] && [[ "$2" = '-c' ]] && set 'help' '-c' "${CONFIG}"  # Add default config for help action
+OPTIND=2  # Ignore first argument ACTION even if it has leading hyphen
+while getopts ':dvc:' OPT; do
+    [[ "${OPTARG: : 1}" = '-' ]] && quit 1 "ERROR: Option argument cannot start with hyphen, got: ${OPTARG}"
+    case "${OPT}" in
+        d|v) DEBUG=1; v=v; ;;
+        c) CONFIG=${OPTARG} ;;
+        :) quit 1 "ERROR: Option -${OPTARG} requires an argument"; ;;
+        *) quit 1 "ERROR: Unrecognized option: -${OPTARG}"
+    esac
+done
+### END Parse options
+
+
+### Verify ACTION
+case "${ACTION}" in
+    ''|help|usage|tricks|version|find|search|approve|confirm|move|mv|automove) ;;
+    -d|-v|-c) quit 1 "ERROR: All options must be specified after action, got action: ${ACTION}";;
+    *) quit 1 "ERROR: Unrecognized action: ${ACTION}"
+esac
+### END Verify ACTION
+
+### Informational case
+case "${ACTION}" in
+    help|usage|'')
+        [[ "$2" = '-c' ]] && quit 255 "${CONFIG_USAGE}"
+        quit 255 "${USAGE}"
+        ;;
+    tricks)
+        quit 255 "${TRICKS}"
+        ;;
+    version)
+        quit 255 "${FINDNCLEAN_VERSION}"
+        ;;
+esac
+### END Informational case
+
+unset DESCRIPTION USAGE CONFIG_USAGE TRICKS  # No need help variables yet
+
+### Verify options
+if ! [[ -f "${CONFIG}" ]]; then
+    quit 1 "ERROR: Config file does not exist: ${CONFIG}"
+elif ! [[ -r "${CONFIG}" ]]; then
+    quit 1 "ERROR: Config file is not readable: ${CONFIG}"
+fi
+### END Verify options
+
+### Case for all non-help actions
+log "Start action: ${ACTION}"
+log "Config: ${CONFIG}"
+case "${ACTION}" in
+    find|search|move|mv|automove)
+        parse_config  # Only call for the script life
+        if ((DEBUG)); then
+            log 'Debug mode enabled'
+            log "Config rules count: ${RULES_COUNT}"
+            ((REL_PATH_ALLOW)) && log "Relative paths allowed. Current dir: ${PWD}"
+            log "Effective config content:${CONFIG_CONTENT}"
+        fi
+        ;;
+esac
+case "${ACTION}" in
+    find|search)
+        ## Backup all non-zero size existing result_list files to avoid false positive results if some 'find' command fails
+        ((DEBUG)) && log "All non-zero size existing result_list files will be preliminary backuped:"
+        set_timestamp TIMESTAMP '%Y%m%d%H%M%S'
+        for i in "${RESULT_LISTS[@]}"; do
+            eval "tmp=${i}"  # Unquote
+            [[ -s "${tmp}" ]] && mv --backup=t -${v}T -- "${tmp}" "${tmp}.${TIMESTAMP}~"
+            : >"${tmp}"  # Create new empty file
+        done
+
+        if ((DEBUG)); then
+            tmp="The following commands will be evaluated (you can copy-paste them to bash terminal as is):"
+            for i in "${Commands[@]}"; do tmp+="${EOL}  ${i}"; done
+            log "${tmp}"
+        fi
+
+        parallel_run "${Commands[@]/#/exec -c }"  # Prepending of 'exec -c ' need to avoid additional subshell creation
+
+        # log "List of result files (escaped path):${EOL}$(for f in "${RESULT_LISTS[@]}"; do echo "${f}"; done)"
+        if ((IGNORE_FILES_WITH_NEWLINES)); then
+            plustolog=' (filenames with newline was excluded from the search)'
+        else
+            ## TODO: Calculate correctly even for filenames with newline
+            plustolog=' (if some of found filenames contains newline count will be greater than real)'
+        fi
+        log "Found items count${plustolog}:"
+        eval "wc -l ${RESULT_LISTS[*]}"  # eval required because filenames are escaped
+
+        ## Warning if non-zero exit code exists
+        for i in "${PARALLEL_RUN_EXIT_CODES[@]}"; do
+            if ((i)); then
+                log "WARNING: Some 'find' commands returned non-zero exit code, results could be incomplete or incorrect!"
+                ((DEBUG)) && log "Exit codes list: ${PARALLEL_RUN_EXIT_CODES[*]}"
+                break
+            fi
+        done
+        ;;
+    approve|confirm)
+        quit 255 "This action is not implemented yet.${EOL}You have to manually overview and approve list of files by appending corresponding APPROVED_SUFFIX to result_list value.${EOL}By default APPROVED_SUFFIX is none, so all result_list will be treated as approved."
+        ;;
+    move|mv)
+        ## Backup all non-zero size existing move_log and move_log_err files to avoid false positive results
+        ((DEBUG)) && log "All non-zero size existing move_log and move_log_err files will be preliminary backuped:"
+        set_timestamp TIMESTAMP '%Y%m%d%H%M%S'
+        for i in "${MOVE_LOG[@]}" "${MOVE_LOG_ERR[@]}"; do  # It's fine that MOVE_LOG and MOVE_LOG_ERR could be identical
+            eval "tmp=${i}"  # Unescape
+            [[ -s "${tmp}" ]] && mv --backup=t -${v}T -- "${tmp}" "${tmp}.${TIMESTAMP}~"
+            : >"${tmp}"  # Create new empty file
+        done
+
+        log "Start processing the following move lists in background:"
+        eval "wc -l ${SRC_LISTS[*]}"  # eval required because filenames are escaped
+
+        eval "tmp=({0..$((RULES_COUNT-1))})"
+        parallel_run "${tmp[@]/#/rule_move }"
+
+        ## Get values from subshells temp files
+        for ((i=0; i<RULES_COUNT; ++i)); do
+            eval "IFS=: read MOVE_OK_COUNT[${i}] MOVE_CANCEL_COUNT[${i}] MOVE_FAIL_COUNT[${i}] <${PARALLEL_RUN_EXCHANGE_TMPFILE[${i}]}"  # eval need because PARALLEL_RUN_EXCHANGE_TMPFILE values are escaped
+        done
+        TMP_FILES+=("${PARALLEL_RUN_EXCHANGE_TMPFILE[@]}")
+
+        ## Log stats
+        TOTAL_MOVE_OK_COUNT=$((${MOVE_OK_COUNT[@]/#/+}))
+        TOTAL_MOVE_CANCEL_COUNT=$((${MOVE_CANCEL_COUNT[@]/#/+}))
+        TOTAL_MOVE_FAIL_COUNT=$((${MOVE_FAIL_COUNT[@]/#/+}))
+        msg="Moved items count (successful canceled failed move_log  [move_log_err]):"
+        for ((i=0; i<RULES_COUNT; ++i)); do
+            printf -v tmp "${EOL}  %0${#TOTAL_MOVE_OK_COUNT}s %0${#TOTAL_MOVE_CANCEL_COUNT}s %0${#TOTAL_MOVE_FAIL_COUNT}s " "${MOVE_OK_COUNT[${i}]}" "${MOVE_CANCEL_COUNT[${i}]}" "${MOVE_FAIL_COUNT[${i}]}"
+            eval "tmp+=${MOVE_LOG[${i}]}"
+            [[ "${MOVE_LOG[${i}]}" != "${MOVE_LOG_ERR[${i}]}" ]] && eval "tmp+=\ \ ${MOVE_LOG_ERR[${i}]}"
+            msg+=${tmp}
+        done
+        if ((RULES_COUNT > 1)); then
+            printf -v tmp "${EOL}  %0${#TOTAL_MOVE_OK_COUNT}s %0${#TOTAL_MOVE_CANCEL_COUNT}s %0${#TOTAL_MOVE_FAIL_COUNT}s " "${TOTAL_MOVE_OK_COUNT}" "${TOTAL_MOVE_CANCEL_COUNT}" "${TOTAL_MOVE_FAIL_COUNT}"
+            msg+="${tmp}total"
+        fi
+        log "${msg}"
+        ### END Log stats
+        ;;
+    automove)
+        quit 255 'This action is not implemented yet.'
+        ;;
+    *)  quit 1 "ERROR: Unrecognized action: ${ACTION}"
+esac
+### END Case for all non-help actions
+
+log "Finished action: ${ACTION}"
+quit 0

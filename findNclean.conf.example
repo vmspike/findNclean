@@ -1,0 +1,57 @@
+# This is simple example of configuration file to try findNclean
+# For verbose config options description refer
+#   ./findNclean help -c
+# You can use this file with:
+#   ./findNclean find -c ./findNclean.conf.example
+# Then (be careful)
+#   ./findNclean move -c ./findNclean.conf.example
+
+<Global>
+    DEBUG = true
+    REL_PATH_ALLOW = true
+    APPROVED_SUFFIX = .approved
+    # IGNORE_FILES_WITH_NEWLINES = false
+    # FIND_EXPR_GLOBAL = -depth
+</Global>
+
+## Uncomment only if you're going to use only 'find' action.
+# <Rule  Minimal Rule that just find all items inside /tmp directory>
+#     result_list = All items inside tmp directory.find-example.csv
+#     search_path = /tmp
+# </Rule>
+
+<Rule1  find/move old unused *.tmp files in /tmp, /var and current user home dir>
+    result_list = ./ancient-tmp.find-example.csv
+
+    ## find only options
+    search_path = /var/
+    search_path = /tmp/
+    search_path = ~/
+    type = f
+    name = .*\.tmp
+    accessed < 2017
+
+    ## move only options
+    move_path    = ./
+    move_log     = ./ancient-tmp.move-example.csv
+    move_log_err = ./ancient-tmp.move-example.err.csv
+</Rule1>
+
+<Rule2  The same as above but for small non-zero logs>
+    result_list = ./ancient-logs.find-example.csv
+
+    ## find only options
+    search_path = ~/
+    search_path = /var/
+    search_path = /tmp/
+    type = f
+    name = .*\.log(\.gz)?
+    size >  0
+    size <= 2M
+    accessed < 2017
+
+    ## move only options
+    move_path    = ./
+    move_log     = ./ancient-logs.move-example.csv
+    move_log_err = ./ancient-logs.move-example.err.csv
+</Rule2>
