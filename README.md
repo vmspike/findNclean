@@ -15,18 +15,22 @@ features of modern envs (like Ubuntu 16.04) if possible.
 For more info just run it without arguments.
 For even more info see the code ;)!
 
-##### To try
+## To try
 - Clone this repo to your *nix host
-- Quickly review the docs
+```
+cd ~/path/to
+git clone https://github.com/vmspike/findNclean.git
+cd findNclean
+```
+- Quickly review the docs and example of synthetic verbose output
 ```bash
 ./findNclean
 ./findNclean help -c
 ./findNclean tricks
+less example.out
 ```
-- Check/edit findNclean.conf.example
+- Review/edit `./findNclean.conf.example`
 - Run `./findNclean find -c ./findNclean.conf.example`
 - Check result lists, remove lines with items you want to keep.
 - Add `.approved` suffix to the result lists filenames
 - Run `./findNclean mv -c ./findNclean.conf.example`
-
-Example of synthetic verbose output see in example.out
