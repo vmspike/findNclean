@@ -22,12 +22,11 @@ EOF
 # - Support MOVE_STRUCTURE=tree
 # - Action 'automove'
 # - See inline TODO comments
+# - Check if findNclean instance with the same config is already running
 # - Calculate execution time correctly (independently of host datetime)
 # - Log size for folders (currently size logged for files only)
 # - User/group name regex (transform to several users on the system with OR because find does not support regex for user/group names)
 # - Full support for files with a name containing a newline (for mv action and find calculations, now only 'find' logging supported)
-# - Globbing support for search_path (currently only explicitly specified path allowed)
-# - Implement timezone support for ancient env (e.g. workaround for touch - use find TZ variable?)
 # - Test on various platforms and environments (currently only tested on CentOS 5.5 and Ubuntu 16.04 LTS)
 ### END Possible improvements
 
@@ -111,7 +110,7 @@ MOVE_STRUCTURE=f
 readonly ACTION=$1
 
 ## Space-separated list of required apps which must be on the system
-DEPENDENCIES='find wc mv'
+DEPENDENCIES='find mv wc'
 ((BV <= 4002000)) && DEPENDENCIES+=' date'
 ((FV <  4003005)) && DEPENDENCIES+=' touch'
 # DEPENDENCIES+=' getent'
@@ -309,9 +308,9 @@ Config usage:
             http://lists.gnu.org/archive/html/bug-findutils/2011-11/msg00015.html
         Filesystem items can has this time set but 'find/stat' cannot read it.
         You can check it via:
-            find ./somefile -newerBt 1970-01-01
-            stat ./somefile
-            debugfs -R "stat <$(stat -c %i ./somefile)>" /dev/DRIVEX
+            find / -newerBt 1970-01-01
+            stat /
+            debugfs -R "stat <$(stat -c %i /)>" /dev/DRIVEX
 
     amin {>|=|<}
     cmin {>|=|<}
@@ -616,9 +615,9 @@ log() {
 }
 
 ##
-# Set global TIMESTAMP variable with current time format $1
+# Set global variable with the name $1 and time format $2
 # Globals:
-#   $2 or TIMESTAMP
+#   name of $1 or
 # Args:
 #   timestamp format
 #   variable name to set
@@ -768,14 +767,14 @@ complete_globals() {
 #   commands to run as a positional args
 ##
 parallel_run() {
-    local ts TS i j pids tmp EXCHANGE_TMPFILE
-    set_timestamp ts '%s'
-    pids=()
+    local ts TS i j pids tmp
+    local EXCHANGE_TMPFILE  # This variable will be used by subprocess to store results
+    PARALLEL_RUN_EXCHANGE_TMPFILE=()  # Array of escaped EXCHANGE_TMPFILE's
     PARALLEL_RUN_EXIT_CODES=()
-    PARALLEL_RUN_EXCHANGE_TMPFILE=()
+    pids=()
+    set_timestamp ts '%s'
     j=0
     for i in "$@"; do
-        ## This variable will be used by subprocess to store results
         EXCHANGE_TMPFILE="${TMPDIR}/findNclean.exch${RANDOM}.tmp"  # Not escaped
         eval "${i}" &
         pids+=("$!")
@@ -1016,7 +1015,7 @@ parse_config() {
             esac
         ## Rule opts
         else
-            [[ "${line: : 1}" = '<' && "${line: -1}" = '>' ]] && quit 1 "Config ERROR on line ${line_number}: Invalid tag: ${line}"
+            [[ "${line:0:1}" = '<' && "${line: -1}" = '>' ]] && quit 1 "Config ERROR on line ${line_number}: Invalid tag: ${line}"
             ((rule_unclosed)) || quit 1 "Config ERROR on line ${line_number}: Config option specified outside of Rule"
 
             ## Parse options for current rule
@@ -1068,7 +1067,7 @@ parse_config() {
                 || "${arg_name}" = 'move_log'
                 || "${arg_name}" = 'move_log_err'
                ]]; then
-                if [[ "${arg_val: : 1}" != '/' ]]; then
+                if [[ "${arg_val:0:1}" != '/' ]]; then
                     if ! ((REL_PATH_ALLOW)); then  # Absolute path only
                         quit 1 "Config ERROR on line ${line_number}: Value restricted to be full path for option '${arg_name}'"
                     else  # Relative path allowed
@@ -1198,8 +1197,8 @@ parse_config() {
                         M) multiplier=1048576 ;;
                         G) multiplier=1073741824 ;;
                     esac
-                    # ((arg_val=multiplier*${arg_val: : -1}))
-                    ((arg_val=multiplier*${arg_val: : ${#arg_val}-1}))  # For older bash versions compatibility
+                    # ((arg_val=multiplier*${arg_val:0: -1}))
+                    ((arg_val=multiplier*${arg_val:0:${#arg_val}-1}))  # For older bash versions compatibility
                     arg_val+='c'
                 else
                     quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
@@ -1238,6 +1237,10 @@ parse_config() {
                         modified) opt=newermt ;;
                         changed) opt=newerct ;;
                         born) opt=newerBt
+                            # Commented because if OS support it but rootfs FS is not but
+                            # search_path located on other FS which support it this error
+                            # will be incorrect - have to check all search_path's
+                            # TODO: fix it
                             ## Check if find/stat can use birth time
                             # tmp=$(exec -c stat -c '%W' /)
                             # if [[ $? -ne 0 || "${tmp}" = '0' || "${tmp}" = 'W' ]]; then
@@ -1576,7 +1579,7 @@ done; unset util
 [[ "${ACTION}" = 'help' || "${ACTION}" = 'usage' ]] && [[ "$2" = '-c' ]] && set 'help' '-c' "${CONFIG}"  # Add default config for help action
 OPTIND=2  # Ignore first argument ACTION even if it has leading hyphen
 while getopts ':dvc:' OPT; do
-    [[ "${OPTARG: : 1}" = '-' ]] && quit 1 "ERROR: Option argument cannot start with hyphen, got: ${OPTARG}"
+    [[ "${OPTARG:0:1}" = '-' ]] && quit 1 "ERROR: Option argument cannot start with hyphen, got: ${OPTARG}"
     case "${OPT}" in
         d|v) DEBUG=1; v=v; ;;
         c) CONFIG=${OPTARG} ;;
@@ -1673,7 +1676,7 @@ case "${ACTION}" in
         done
         ;;
     approve|confirm)
-        quit 255 "This action is not implemented yet.${EOL}You have to manually overview and approve list of files by appending corresponding APPROVED_SUFFIX to result_list value.${EOL}By default APPROVED_SUFFIX is none, so all result_list will be treated as approved."
+        quit 255 "This action is not implemented yet.${EOL}You have to manually overview and approve list of files by appending${EOL}corresponding APPROVED_SUFFIX to the result_list value.${EOL}By default APPROVED_SUFFIX is none, so all result_list will be treated as approved."
         ;;
     move|mv)
         ## Backup all non-zero size existing move_log and move_log_err files to avoid false positive results
