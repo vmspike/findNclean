@@ -22,6 +22,14 @@ cd ~/path/to
 git clone https://github.com/vmspike/findNclean.git
 cd findNclean
 ```
+Or just download executable and optionally config example
+```
+mkdir findNclean
+cd findNclean
+wget https://github.com/vmspike/findNclean/raw/master/findNclean
+chmod +x findNclean
+wget https://github.com/vmspike/findNclean/raw/master/findNclean.conf.example
+```
 - Quickly review the docs and example of synthetic verbose output
 ```bash
 ./findNclean
@@ -31,6 +39,6 @@ less example.out
 ```
 - Review/edit `./findNclean.conf.example`
 - Run `./findNclean find -c ./findNclean.conf.example`
-- Check result lists, remove lines with items you want to keep.
+- Check result lists, remove lines with the items you want to keep.
 - Add `.approved` suffix to the result lists filenames
 - Run `./findNclean mv -c ./findNclean.conf.example`
