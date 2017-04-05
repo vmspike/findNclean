@@ -590,7 +590,7 @@ MOVE_LOG=()
 MOVE_LOG_ERR=()
 MOVE_ATTEMPTS=()
 MOVE_ATTEMPTS_INTERVAL=()
-MOVE_COMPRESS=()
+# MOVE_COMPRESS=()
 NOTIFY=()
 MOVE_OK_COUNT=()
 MOVE_CANCEL_COUNT=()
@@ -603,6 +603,7 @@ MOVE_FAIL_COUNT=()
 quit() {
     [[ -n $2 ]] && echo "$2" >&2
     # for f in "${TMP_FILES[@]}"; do rm -${v}f -- "$f"; done &>/dev/null
+    # shellcheck disable=SC2086
     [[ -n "${TMP_FILES[*]}" ]] && eval rm -${v}f -- "${TMP_FILES[@]}" >&2  # Eval because filenames are escaped
     (($1 > 0 && $1 < 255)) && notify "exit code is $1.${EOL}Message: $2"
     exit "$1"
@@ -949,6 +950,7 @@ parse_config() {
                     flat|f|tree|t) ;;
                     *) quit 1 "Config ERROR on line ${line_number}: Invalid value for option '${arg_name}': ${arg_val}"
                 esac
+                # shellcheck disable=SC2034
                 MOVE_STRUCTURE=${arg_val}
             else
                 quit 1 "Config ERROR on line ${line_number}: Unrecognized global option: '${arg_name}'"
@@ -986,6 +988,7 @@ parse_config() {
             rule_unclosed=0  # 0:false
             RULES_COUNT=${rule_num}
 
+            # shellcheck disable=SC2154
             ((result_list_count)) || quit 1 "Config ERROR on line ${line_number}: 'result_list' option is mandatory"
 
             case "${ACTION}" in
@@ -1071,6 +1074,7 @@ parse_config() {
                     if ! ((REL_PATH_ALLOW)); then  # Absolute path only
                         quit 1 "Config ERROR on line ${line_number}: Value restricted to be full path for option '${arg_name}'"
                     else  # Relative path allowed
+                        # shellcheck disable=SC2088
                         if   ((${#arg_val} >= 3)) && [[ "${arg_val::3}" = '../' ]] \
                           || ((${#arg_val} >= 2)) && [[ "${arg_val::2}" = './'  ]]; then
                             :

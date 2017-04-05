@@ -39,6 +39,6 @@ less example.out
 ```
 - Review/edit `./findNclean.conf.example`
 - Run `./findNclean find -c ./findNclean.conf.example`
-- Check result lists, remove lines with the items you want to keep.
+- Check result lists, remove the lines with the items you want to keep.
 - Add `.approved` suffix to the result lists filenames
 - Run `./findNclean mv -c ./findNclean.conf.example`
